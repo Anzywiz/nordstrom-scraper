@@ -1,0 +1,3 @@
+seleniumbase
+python-dotenv
+curl_cffi
