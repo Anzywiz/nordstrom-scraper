@@ -343,6 +343,29 @@ async def fetch_checked(sess, cfg, url, keep_facets=False, tab=0, expect=None, t
     return None
 
 
+async def fetch_count(sess, cfg, url, tries=None):
+    """resultCount of a listing URL. None = could not read it (blocked / failed / empty config).
+    A REAL zero (filter understood, nothing matches) returns 0 - unlike fetch_checked, which treats an
+    empty page as a soft block."""
+    for _ in range(tries or cfg["listing"]["max_attempts"]):
+        res = await fetch_listing(sess, cfg, url)
+        count = None
+        if res.kind == "ok":
+            try:
+                data = json.loads(res.data)
+            except (TypeError, ValueError):
+                data = None
+            count = find_first(data, "resultCount") if data is not None else None
+            if count is None:
+                res = Fetch("blocked", detail="no resultCount in page")
+        await sess.report(res)
+        if count is not None:
+            return int(count)
+        if res.kind == "gone":
+            return None
+    return None
+
+
 # ── planning: how to cover a category ────────────────────────────────────
 def pack_groups(brands, max_products, max_brands):
     """Greedy packing of brands (in facet order) into groups of <= max_products / max_brands.
@@ -365,21 +388,39 @@ def pack_groups(brands, max_products, max_brands):
     return groups
 
 async def verify_grouping(sess, cfg, cat, brands):
-    """Does a multi-brand filter return the SUM of the brands? -> working style or None."""
-    sample = [b for b in brands if 0 < b["count"] <= 800][:3] or brands[:3]
+    """Does a multi-brand filter return the SUM of the brands?
+    -> working style | "none" (tested conclusively, no style works) | None (inconclusive: blocked).
+    The expected value is the sum of each sample brand's ACTUAL resultCount (fetched alone), not the
+    facet count. A blocked/unreadable page is never treated as 'got 0'."""
+    pool = [b for b in brands if 20 <= b["count"] <= 300] or [b for b in brands if 0 < b["count"] <= 800]
+    sample = pool[:3]
     if len(sample) < 2:
+        return "none"
+    singles = []
+    for b in sample:
+        n = await fetch_count(sess, cfg, build_url(cfg, cat, 1, [b["slug"]]), tries=3)
+        if n is None:
+            log_warn(f"grouping test: could not read brand '{b['name']}' (blocked) - inconclusive")
+            return None
+        log_info(f"grouping test: brand '{b['name']}' facet={b['count']:,} actual={n:,}")
+        singles.append(n)
+    want = sum(singles)
+    if want == 0:
         return None
-    want = sum(b["count"] for b in sample)
+    inconclusive = False
     for style in cfg["listing"]["group_styles"]:
         url = build_url(cfg, cat, 1, [b["slug"] for b in sample], style)
-        data = await fetch_checked(sess, cfg, url, tries=3)
-        got = (find_first(data, "resultCount") or 0) if data else 0
-        log_info(f"grouping test '{style}': {len(sample)} brands expected {want:,} -> got {got:,}")
-        if data and abs(got - want) <= max(2, 0.02 * want):
+        got = await fetch_count(sess, cfg, url, tries=3)
+        if got is None:
+            log_warn(f"grouping test '{style}': could not read the page (blocked) - inconclusive, not a failure")
+            inconclusive = True
+            continue
+        log_info(f"grouping test '{style}': {len(sample)} brands, singles sum {want:,} -> got {got:,}")
+        if abs(got - want) <= max(2, 0.02 * want):
             return style
-    return None
+    return None if inconclusive else "none"
 
-async def plan_category(sess, cfg, name, cat, args):
+async def plan_category(sess, cfg, name, cat, args, progress=None):
     """-> (info, {partition_key: partition}, first_page_data_or_None)"""
     L = cfg["listing"]
     data = await fetch_checked(sess, cfg, build_url(cfg, cat, 1), keep_facets=True)
@@ -422,7 +463,26 @@ async def plan_category(sess, cfg, name, cat, args):
 
     style = None
     if L.get("group_brands", True) and not args.no_group:
-        style = await verify_grouping(sess, cfg, cat, brands)
+        style = (progress or {}).get("group_style")
+        if style:
+            log_info(f"[{name}] using multi-brand style '{style}' verified earlier in this run")
+        else:
+            verdict = None
+            for rnd in range(int(L.get("group_verify_rounds", 3))):
+                verdict = await verify_grouping(sess, cfg, cat, brands)
+                if verdict is not None:
+                    break
+                log_warn(f"[{name}] grouping test inconclusive (round {rnd + 1}) - trying again")
+            if verdict is None:
+                if not L.get("fallback_per_brand", False):
+                    log_err(f"[{name}] grouping test stayed inconclusive (blocks). NOT falling back to "
+                            f"{len(brands):,} single-brand partitions - re-run to retry "
+                            f"(or set listing.fallback_per_brand=true)")
+                    return None
+                verdict = "none"
+            style = None if verdict == "none" else verdict
+            if style and progress is not None:
+                progress["group_style"] = style
     parts = {}
     if style:
         max_products = int(reach * float(L["group_fill_ratio"]))
@@ -573,6 +633,14 @@ async def run_listing(cfg, args):
     categories = [n for n in cfg["categories"] if not args.category or n == args.category]
     if not categories:
         raise SystemExit(f"Unknown category {args.category!r}. Available: {', '.join(cfg['categories'])}")
+    if args.replan:                                    # throw away a saved (bad) plan; products already saved stay
+        for name in categories:
+            progress["plan"].pop(name, None)
+            for k in [k for k, P in progress["partitions"].items() if P["category"] == name]:
+                progress["partitions"].pop(k)
+                progress["gaps"].pop(k, None)
+        progress.pop("group_style", None)
+        log_info(f"Re-planning: {', '.join(categories)}")
     if args.reopen:
         for key, P in progress["partitions"].items():
             if args.reopen in ("all", key, P["category"]):
@@ -588,7 +656,7 @@ async def run_listing(cfg, args):
             for name in categories:
                 if name in progress["plan"]:
                     continue
-                planned = await plan_category(sess, cfg, name, cfg["categories"][name], args)
+                planned = await plan_category(sess, cfg, name, cfg["categories"][name], args, progress)
                 if planned is None:
                     continue
                 info, parts, first = planned
@@ -670,6 +738,7 @@ def main():
     ap.add_argument("--reopen", help="'all', a category or a partition key: set done=false")
     ap.add_argument("--max-pages", type=int, default=0, help="stop after N pages this run (testing)")
     ap.add_argument("--limit-brands", type=int, default=0, help="only the first N brands per category (testing)")
+    ap.add_argument("--replan", action="store_true", help="discard the saved plan for the selected categories and plan again (keeps saved products)")
     ap.add_argument("--no-group", action="store_true", help="never pack brands into groups")
     ap.add_argument("--top", type=int, help="override listing.top (items per request)")
     ap.add_argument("--source", choices=["page", "api"], help="override listing.source")
