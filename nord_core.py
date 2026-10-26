@@ -39,7 +39,7 @@ _ENV_RE = re.compile(r"\$\{([A-Za-z0-9_]+)\}")
 REQUIRED_KEYS = [
     "site.url", "output_dir", "categories", "browser.workers", "browser.tabs_per_browser",
     "listing.source", "listing.config_keys", "enrich.max_attempts",
-    "retry.base_backoff_seconds", "files.listing_jsonl", "files.products_csv",
+    "retry.delay_seconds", "files.listing_jsonl", "files.products_csv",
     "fixed_values",
 ]
 
@@ -144,14 +144,15 @@ def proxy_list() -> list:
     return [p for p in (x.strip() for x in re.split(r"[,\n]", raw)) if p]
 
 class ProxyPool:
-    """Hands out proxies least-recently-used first and skips ones that just failed.
+    """Hands out proxies least-recently-used first (round-robin) and skips ones that just failed.
     With no proxies configured, acquire() returns None (direct connection)."""
 
     def __init__(self, raw_list, cooldown=120):
         self.items = [parse_proxy(p) for p in raw_list if parse_proxy(p)]
         self.cooldown = cooldown
-        self.last_used = {p["label"]: 0.0 for p in self.items}
-        self.cool_until = {p["label"]: 0.0 for p in self.items}
+        # keyed by URL: with a rotating gateway every login shares the same host:port (= same label)
+        self.last_used = {p["url"]: 0.0 for p in self.items}
+        self.cool_until = {p["url"]: 0.0 for p in self.items}
         self.in_use = set()
 
     def __len__(self):
@@ -161,25 +162,25 @@ class ProxyPool:
         if not self.items:
             return None
         now = time.time()
-        free = [p for p in self.items if p["label"] not in self.in_use and self.cool_until[p["label"]] <= now]
+        free = [p for p in self.items if p["url"] not in self.in_use and self.cool_until[p["url"]] <= now]
         if not free:
-            free = [p for p in self.items if p["label"] not in self.in_use] or list(self.items)
-        pick = min(free, key=lambda p: self.last_used[p["label"]])
-        self.last_used[pick["label"]] = now
-        self.in_use.add(pick["label"])
+            free = [p for p in self.items if p["url"] not in self.in_use] or list(self.items)
+        pick = min(free, key=lambda p: self.last_used[p["url"]])
+        self.last_used[pick["url"]] = now
+        self.in_use.add(pick["url"])
         return pick
 
     def release(self, proxy):
         if proxy:
-            self.in_use.discard(proxy["label"])
+            self.in_use.discard(proxy["url"])
 
     def fail(self, proxy):
         if proxy:
-            self.cool_until[proxy["label"]] = time.time() + self.cooldown
+            self.cool_until[proxy["url"]] = time.time() + self.cooldown
 
     def ok(self, proxy):
         if proxy:
-            self.cool_until[proxy["label"]] = 0.0
+            self.cool_until[proxy["url"]] = 0.0
 
 
 # ── DBQ E0005 columns ─────────────────────────────────────────────────────
