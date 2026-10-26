@@ -42,7 +42,7 @@ from urllib.parse import parse_qs, urlencode
 
 from nord_browser import LISTING_JS, Crawler, Fetch, TaskQueue
 from nord_core import (COLUMNS, ROOT, build_base_row, json_list_capped, load_config, load_json,
-                       log_err, log_head, log_info, log_ok, log_warn, rpath, save_json_atomic, today)
+                       log_err, log_head, log_info, log_line, log_ok, log_warn, rpath, save_json_atomic, today)
 
 
 # ── JSON helpers (the nesting is not fully known, so search by key) ───────
@@ -177,6 +177,7 @@ def parse_product(pid, p, site, job_name, page, rank, is_organic, now):
 
     return {
         "product_id": pid,
+        "core_product_id": dflt or (colors[0]["core_choice_id"] if colors else None),   # = defaultCoreChoice
         "style_group_id": p.get("legacyStyleGroupId"),
         "title": p.get("copyProductTitle"),
         "brand": p.get("labelDisplayName"),
@@ -222,11 +223,14 @@ def listing_row(r, base):
     for n, c in enumerate(cats[:10], 1):
         row[f"category{n}"] = c
     colors = r.get("colors") or []
+    code = r.get("core_product_id") or (colors[0].get("core_choice_id") if colors else "") or ""
     # first 2 images per colour (round-robin), capped < Excel's 32,767-char cell limit
     per_color = [c.get("images", [])[:2] for c in colors]
     images = list(dict.fromkeys(i for grp in zip(*[g + [None] * (2 - len(g)) for g in per_color]) for i in grp if i)) if per_color else []
     row.update({
-        "product_code": r.get("style_group_id") or "",
+        "product_code": code,                                   # core product id (defaultCoreChoice)
+        "additional_code_1": r.get("product_id") or "",
+        "additional_code_1_type": "PRODUCT_ID" if r.get("product_id") else "",
         "brand": r.get("brand") or "",
         "product_title": r.get("title") or "",
         "color_info": " | ".join(c["color"] for c in colors if c.get("color")),
@@ -237,7 +241,7 @@ def listing_row(r, base):
         "promotion_type": ", ".join(r.get("enticements") or []),
         "additional_tags": ", ".join(r.get("enticements") or []),
         "additional_content": json.dumps({
-            "web_style_id": r.get("product_id"), "price_max": r.get("price_max"),
+            "web_style_id": r.get("product_id"), "item_number": r.get("style_group_id"), "price_max": r.get("price_max"),
             "full_price_max": r.get("full_price_max"), "discount_pct_max": r.get("discount_pct_max"),
             "n_colors": r.get("n_colors"), "n_skus": r.get("n_skus"),
             "review_count": r.get("review_count"), "avg_rating": r.get("avg_rating"),
@@ -291,7 +295,7 @@ def build_url(cfg, cat, page, slugs=None, style="repeat") -> str:
     api = L["source"] == "api"
     params = []
     if api:
-        params += [("top", L.get("top") or 150), ("include", "ads"), ("include", "enticements")]
+        params += [("top", L.get("top") or 120), ("include", "ads"), ("include", "enticements")]
     elif L.get("top"):
         params.append(("top", L["top"]))
     params += [("breadcrumb", cat["breadcrumb"]), ("origin", "topnav"), ("page", page)]
@@ -533,9 +537,9 @@ class Listing:
         remaining = sum(max((p["page_count"] or 1) - len(p["done_pages"]), 0) for p in self.parts.values()
                         if not p["done"])
         eta = remaining / rate / 60 if rate else 0
-        print(f"  progress: {done}/{len(self.parts)} partitions done | {len(self.seen):,} products | "
-              f"{self.stats['pages']} pages ({rate:.2f}/s) | failed requests {self.stats['failed_requests']} | "
-              f"~{remaining} pages left, ETA ~{eta:.0f} min", flush=True)
+        log_line(f"progress: {done}/{len(self.parts)} partitions done | {len(self.seen):,} products | "
+                 f"{self.stats['pages']} pages ({rate:.2f}/s) | failed requests {self.stats['failed_requests']} | "
+                 f"~{remaining} pages left, ETA ~{eta:.0f} min")
 
     def initial_tasks(self, categories):
         n = 0
@@ -653,9 +657,9 @@ async def run_discover(cfg, args):
             log_ok(f"[{name}] products_on_page={len(prods)} (found at {path}) | "
                    f"pageCount={find_first(data, 'pageCount')} resultCount={find_first(data, 'resultCount')} | "
                    f"Brand facet: {len(brand['values']) if brand else 'NOT FOUND'} values")
-            print(f"    config keys: {list(data)[:12]}")
-            print(f"    facets: {facets[:12]}")
-            print(f"    saved {dst.name}" + (" + sample product" if prods else ""))
+            log_line(f"    config keys: {list(data)[:12]}")
+            log_line(f"    facets: {facets[:12]}")
+            log_line(f"    saved {dst.name}" + (" + sample product" if prods else ""))
 
 
 def main():

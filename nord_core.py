@@ -29,6 +29,7 @@ def log_info(m): print(f"\033[36m[{_ts()}] i  {m}\033[0m", flush=True)
 def log_ok(m):   print(f"\033[32m[{_ts()}] ok {m}\033[0m", flush=True)
 def log_warn(m): print(f"\033[33m[{_ts()}] !  {m}\033[0m", flush=True)
 def log_err(m):  print(f"\033[31m[{_ts()}] x  {m}\033[0m", file=sys.stderr, flush=True)
+def log_line(m): print(f"[{_ts()}]    {m}", flush=True)   # plain, timestamped (progress lines)
 
 
 # ── config ────────────────────────────────────────────────────────────────

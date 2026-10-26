@@ -4,7 +4,8 @@
 
 | File | What it is |
 |---|---|
-| `config.json` | Every setting, each one explained in the `_help` blocks. |
+| `config.json` | Settings only (no comments). Every key is explained in `CONFIG.md`. |
+| `CONFIG.md` | Reference for every `config.json` setting, plus the product-code mapping. |
 | `.env.example` | Copy to `.env`: `PROXY_LIST`, optional `NORD_API_KEY`, AWS keys. |
 | `nord_core.py` | Config loader, logging, proxy pool, DBQ columns. Does not import your old `common.py`. |
 | `nord_browser.py` | CloakBrowser sessions: navigate, read `window.__INITIAL_CONFIG__`, block detection, backoff, restart, tabs. |
@@ -52,7 +53,7 @@ the page (up to 120 items per request, needs `NORD_API_KEY`). Try both on a smal
 ## Speed and scale (rough numbers, measure on your machine)
 
 * A navigation took about 3.5 s in your test, plus `retry.delay_seconds` (2 s): ~0.2 pages/s per tab.
-* Listing, 200k products at 72 per page: about 2,800 pages, about 4 hours on one tab.
+* Listing, 200k products at 120 per page: about 1,700 pages, about 2.5 hours on one tab (when brands can be grouped).
 * Enrichment is the hard part: 200k PDPs at ~5.5 s each is about 300 hours on one tab. Daily full refreshes
   need roughly 15 or more tabs in parallel (tabs x browsers), or a smaller scope.
 * Raise `tabs_per_browser` first (1, 2, 3), watching `failed requests` in the progress line; then `workers`.
@@ -65,4 +66,4 @@ the page (up to 120 items per request, needs `NORD_API_KEY`). Try both on a smal
 * The `kids` path/breadcrumb in `config.json`.
 * Proxy arguments for `launch_persistent_context_async`: it tries the URL form, then the dict form. If both
   fail for your installed version, copy the call from your editorialist phase 1b and tell me.
-* Whether `top` is honoured on the page URL: `--discover --top 150`, then read `products_on_page`.
+* Whether `top=120` is honoured on the page URL: `--discover`, then read `products_on_page` (the script measures the real page size anyway).

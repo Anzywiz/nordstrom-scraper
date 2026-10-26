@@ -32,7 +32,7 @@ from collections import Counter
 
 from nord_browser import PDP_JS, Crawler, Fetch, TaskQueue
 from nord_core import (COLUMNS, ROOT, build_base_row, json_list_capped, load_config, log_err, log_head,
-                       log_info, log_ok, log_warn, rpath, today)
+                       log_info, log_line, log_ok, log_warn, rpath, today)
 
 MATERIAL_RE = re.compile(
     r"\b(cotton|polyester|nylon|wool|silk|linen|leather|suede|cashmere|viscose|rayon|spandex|"
@@ -59,9 +59,13 @@ def parse_payload(payload: dict, url: str, base: dict) -> list:
     feats = [f for f in (ent.get("copyFeatures") or []) if f]
     ptags = [t.get("type") for t in prop.get("enticementTags") or [] if t.get("type")]
 
+    # core product id = defaultCoreChoice (same value as in the listing); falls back to the first colour's id
+    default_choice = ent.get("defaultCoreChoice") or next(
+        (ch.get("coreChoiceId") for c in ent.get("coreProducts") or [] for ch in c.get("coreChoices") or []
+         if ch.get("coreChoiceId")), "")
     common = dict(base)
     common.update({
-        "product_code": str(ent.get("legacyStyleGroupId") or ""),
+        "product_code": str(default_choice or ""),
         "brand": ent.get("labelDisplayName") or "",
         "product_title": ent.get("copyProductTitle") or "",
         "description": ent.get("copyDescription") or "",
@@ -130,11 +134,12 @@ def parse_payload(payload: dict, url: str, base: dict) -> list:
                     "price": price or "", "full_price": full or "",
                     "promotion_type": ptype if ptype and ptype != "REGULAR" else "",
                     "additional_tags": ", ".join(dict.fromkeys(t for t in tags if t)),
-                    "additional_code_1": gtin, "additional_code_1_type": "GTIN" if gtin else "",
+                    "additional_code_1": str(ent.get("id") or ""), "additional_code_1_type": "PRODUCT_ID" if ent.get("id") else "",
                     "additional_code_2": sku_id, "additional_code_2_type": "SKU" if sku_id else "",
-                    "additional_code_3": core_id, "additional_code_3_type": "CORE_PRODUCT_ID" if core_id else "",
+                    "additional_code_3": gtin, "additional_code_3_type": "GTIN" if gtin else "",
                     "additional_content": json.dumps({
-                        "web_style_id": ent.get("id"), "core_choice_id": ch.get("coreChoiceId"),
+                        "web_style_id": ent.get("id"), "item_number": ent.get("legacyStyleGroupId"),
+                        "core_choice_id": ch.get("coreChoiceId"), "core_product_id": core_id or None,
                         "color_family": (ch.get("colorFamily") or {}).get("label"),
                         "extra_title": ent.get("extraProductTitle"), "fit_info": fit or None,
                         "is_final_sale": final_sale, "as_of": sprop.get("asOf"),
@@ -237,9 +242,9 @@ class Enrich:
         n_done = self.stats["ok"] + self.stats["gone"] + self.stats["failed"]
         rate = n_done / max(time.time() - self.t0, 1)
         eta = (self.total - n_done) / rate / 60 if rate else 0
-        print(f"  {n_done:,}/{self.total:,} | ok {self.stats['ok']:,} gone {self.stats['gone']:,} "
-              f"failed {self.stats['failed']:,} retried {self.stats['retried']:,} | rows {self.stats['rows']:,} | "
-              f"{rate:.2f} pdp/s | ETA {eta:.0f} min", flush=True)
+        log_line(f"progress: {n_done:,}/{self.total:,} | ok {self.stats['ok']:,} gone {self.stats['gone']:,} "
+                 f"failed {self.stats['failed']:,} retried {self.stats['retried']:,} | rows {self.stats['rows']:,} | "
+                 f"{rate:.2f} pdp/s | ETA {eta:.0f} min")
 
 
 async def run_enrich(cfg, args):
@@ -303,15 +308,15 @@ async def run_single(cfg, url, dump):
             ents = ((cfg_json.get("productDisplay") or {}).get("productDisplaysById") or {}).get("entities") or {}
             ent = ents.get(pid) or next(iter(ents.values()), {})
             log_ok(f"Saved {out}")
-            print("top-level keys:", list(cfg_json))
-            print("entity keys:", list(ent))
+            log_line(f"top-level keys: {list(cfg_json)}")
+            log_line(f"entity keys: {list(ent)}")
             return
         res = await sess.fetch_config(url, PDP_JS, pid, expect=f"/{pid}")
-        print("result:", res.kind, res.detail or res.status, f"{res.secs:.1f}s")
+        log_line(f"result: {res.kind} {res.detail or res.status} {res.secs:.1f}s")
         if res.kind == "ok":
             payload = json.loads(res.data)
             rows = parse_payload(payload, url, build_base_row(cfg))
-            print(f"{len(rows)} rows. First row:")
+            log_line(f"{len(rows)} rows. First row:")
             print(json.dumps(rows[0], indent=2, ensure_ascii=False))
 
 
