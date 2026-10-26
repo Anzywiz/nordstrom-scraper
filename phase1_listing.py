@@ -1,74 +1,51 @@
 #!/usr/bin/env python3
 """
-Phase 1 - Nordstrom listing scraper.
+Phase 1 - Nordstrom listing: ONE script for unfiltered AND brand-filtered crawling.
+There is no separate brand phase any more.
 
-Pages through the category browse API (women / men / kids) and writes one
-record per product to output/products_listing.jsonl .
+What it does, per category (women / men / kids):
+  1. Loads page 1 and reads resultCount + pageCount. Pagination is capped (~695 pages), so
+     reach = pageCount x products-per-page.
+  2. resultCount <= reach  -> crawl the category unfiltered (largest pages, fewest requests).
+  3. resultCount >  reach  -> read the Brand facet from that same page and split the category into
+     partitions that each fit under the cap. Brands are PACKED into groups
+     (listing.group_brands) so every request returns a full page instead of 3 items from a tiny
+     brand. The script first verifies that a multi-brand filter really returns the sum of the
+     brands (it tries listing.group_styles); if none works it falls back to one brand per partition.
+  4. Pages of all partitions go through one queue, fetched by browsers x tabs in parallel.
 
-Why a browser? The endpoint rejects plain navigation / non-browser clients
-(Akamai). So we open nordstrom.com with SeleniumBase CDP (which passes), then
-call the API with fetch() *from inside that page*: same origin, real cookies,
-real TLS fingerprint, plus the nord-* headers the site's own JS sends.
+Where the data comes from (listing.source):
+  page - navigate to /browse/<category>?...&page=N and read window.__INITIAL_CONFIG__ (default,
+         no API key needed)
+  api  - fetch() the sbn/v2 browse API from inside the page (top=150 -> up to 120 items per request)
+
+A blocked page (redirect to siteclosed.nordstrom.com, Access Denied, empty page) is NEVER the end of a
+job: it is backed off and retried, and the browser restarts on a new proxy when it keeps happening.
 
 Usage:
-    python phase1_listing.py --discover              # page 1 of each job, dumps facets
-    python phase1_listing.py --job women --max-pages 2   # smoke test
-    python phase1_listing.py                         # all jobs, resumes automatically
-    python phase1_listing.py --fresh                 # ignore progress + output
-    python phase1_listing.py --export-csv            # just rebuild the CSV
+    python phase1_listing.py --discover                  # page 1 per category, dumps structure + facets
+    python phase1_listing.py --category women --max-pages 3   # smoke test
+    python phase1_listing.py                             # everything, resumes automatically
+    python phase1_listing.py --fresh                     # ignore progress and delete the output
+    python phase1_listing.py --export-csv                # only rebuild listing.csv
 """
 import argparse
+import asyncio
 import csv
 import json
-import os
-import random
-import sys
+import math
 import time
-import uuid
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import urlencode
+from urllib.parse import parse_qs, urlencode
 
-from dotenv import load_dotenv
-
-ROOT = Path(__file__).resolve().parent
-load_dotenv(ROOT / ".env")
-
-from common import (COLUMNS, build_base_row, check_proxies, ensure_relay,  # noqa: E402
-                    json_list_capped, next_proxy, proxy_label, proxy_list)
+from nord_browser import LISTING_JS, Crawler, Fetch, TaskQueue
+from nord_core import (COLUMNS, ROOT, build_base_row, json_list_capped, load_config, load_json,
+                       log_err, log_head, log_info, log_ok, log_warn, rpath, save_json_atomic, today)
 
 
-# ── logging ───────────────────────────────────────────────────────────────
-def _ts():
-    return datetime.now().strftime("%H:%M:%S")
-
-def log_info(m): print(f"\033[36m[{_ts()}] i  {m}\033[0m", flush=True)
-def log_ok(m):   print(f"\033[32m[{_ts()}] ok {m}\033[0m", flush=True)
-def log_warn(m): print(f"\033[33m[{_ts()}] !  {m}\033[0m", flush=True)
-def log_err(m):  print(f"\033[31m[{_ts()}] x  {m}\033[0m", file=sys.stderr, flush=True)
-
-
-# ── config / io ───────────────────────────────────────────────────────────
-def load_config(path: Path) -> dict:
-    cfg = json.loads(path.read_text(encoding="utf-8"))
-    if os.getenv("NORD_API_KEY"):
-        cfg["headers"]["nord-api-key"] = os.environ["NORD_API_KEY"].strip()
-    if os.getenv("HEADLESS", "").strip():
-        cfg["headless"] = os.environ["HEADLESS"].strip().lower() in ("1", "true", "yes")
-    return cfg
-
-def rpath(cfg, key) -> Path:
-    p = ROOT / cfg[key]
-    p.parent.mkdir(parents=True, exist_ok=True)
-    return p
-
-def save_json_atomic(path: Path, obj):
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(obj, indent=2), encoding="utf-8")
-    tmp.replace(path)
-
-
-# ── JSON helpers (response nesting wasn't fully visible, so search for keys)
+# ── JSON helpers (the nesting is not fully known, so search by key) ───────
 def find_first(obj, key):
     stack = [obj]
     while stack:
@@ -81,18 +58,38 @@ def find_first(obj, key):
             stack.extend(o)
     return None
 
+def locate_products(obj):
+    """-> (container dict, path). The container is the dict holding the MOST product entries
+    (an entry = dict with 'webPathAlias'); used by --discover to show where products live."""
+    best, best_n, best_path = None, 0, ""
+    stack = [(obj, "")]
+    while stack:
+        o, path = stack.pop()
+        if isinstance(o, dict):
+            n = sum(1 for v in o.values() if isinstance(v, dict) and "webPathAlias" in v)
+            if n > best_n:
+                best, best_n, best_path = o, n, path or "/"
+            stack.extend((v, f"{path}/{k}") for k, v in o.items() if isinstance(v, (dict, list)))
+        elif isinstance(o, list):
+            stack.extend((v, f"{path}[{i}]") for i, v in enumerate(o) if isinstance(v, (dict, list)))
+    return best, best_path
+
 def find_products(obj):
-    """Return the {product_id: product} dict wherever it lives in the response."""
+    """{product_id: product}: the biggest dict of product entries anywhere in the payload."""
+    best, best_n = None, 0
     stack = [obj]
     while stack:
         o = stack.pop()
         if isinstance(o, dict):
-            if any(isinstance(v, dict) and "webPathAlias" in v for v in o.values()):
-                return o
-            stack.extend(o.values())
+            n = sum(1 for v in o.values() if isinstance(v, dict) and "webPathAlias" in v)
+            if n > best_n:
+                best, best_n = o, n
+            stack.extend(v for v in o.values() if isinstance(v, (dict, list)))
         elif isinstance(o, list):
-            stack.extend(o)
-    return {}
+            stack.extend(v for v in o if isinstance(v, (dict, list)))
+    if not best:
+        return {}
+    return {k: v for k, v in best.items() if isinstance(v, dict) and "webPathAlias" in v}
 
 def strip_products(obj, products):
     if obj is products:
@@ -103,128 +100,47 @@ def strip_products(obj, products):
         return [strip_products(v, products) for v in obj]
     return obj
 
+def find_facets(obj):
+    """[(name, n_values)] of every facet-like dict found (name + values list)."""
+    out, stack = [], [obj]
+    while stack:
+        o = stack.pop()
+        if isinstance(o, dict):
+            if isinstance(o.get("name"), str) and isinstance(o.get("values"), list):
+                out.append((o["name"], len(o["values"])))
+            stack.extend(v for v in o.values() if isinstance(v, (dict, list)))
+        elif isinstance(o, list):
+            stack.extend(v for v in o if isinstance(v, (dict, list)))
+    return out
 
-# ── browser session ───────────────────────────────────────────────────────
-FETCH_JS = """
-(function () {
-  window.__nr = null;
-  fetch(__URL__, {method: 'GET', headers: __HEADERS__, credentials: 'include'})
-    .then(async r => { const t = await r.text(); window.__nr = {status: r.status, text: t}; })
-    .catch(e => { window.__nr = {status: 0, text: String(e)}; });
-  return true;
-})()
-"""
+def find_brand_facet(obj):
+    """Facet dict named 'Brand' with a values list (largest one if several)."""
+    best, stack = None, [obj]
+    while stack:
+        o = stack.pop()
+        if isinstance(o, dict):
+            if o.get("name") == "Brand" and isinstance(o.get("values"), list):
+                if best is None or len(o["values"]) > len(best["values"]):
+                    best = o
+            stack.extend(o.values())
+        elif isinstance(o, list):
+            stack.extend(o)
+    return best
 
-class Session:
-    def __init__(self, cfg):
-        self.cfg = cfg
-        self.sb = None
-        self.headers = {}
-
-    def start(self):
-        from seleniumbase import sb_cdp
-        kw = dict(locale="en", guest=True)
-        if self.cfg.get("headless"):
-            kw["headless"] = True
-        proxy = next_proxy()
-        if proxy:
-            kw["proxy"] = ensure_relay(proxy)
-        log_info(f"Opening browser and warming up session (proxy: {proxy_label(proxy)})...")
-        self.sb = sb_cdp.Chrome(**kw)
-        self.sb.goto(self.cfg["site_url"] + self.cfg.get("warmup_path", "/"))
-        time.sleep(self.cfg.get("warmup_seconds", 10))
-        self.headers = self._build_headers()
-        log_ok("Session ready")
-
-    def stop(self):
-        try:
-            self.sb.driver.stop()
-        except Exception:
-            pass
-        self.sb = None
-
-    def restart(self):
-        log_warn("Restarting browser session...")
-        self.stop()
-        time.sleep(random.uniform(3, 6))
-        self.start()
-
-    def _build_headers(self) -> dict:
-        h = dict(self.cfg["headers"])
-        h["nord-context-id"] = str(uuid.uuid4())
-        h["ads-nord-context-id"] = str(uuid.uuid4())
-        h["eventcustomer"] = json.dumps({"idType": "SHOPPER_ID", "id": uuid.uuid4().hex})
-        # reuse the experiment id the site put in its own cookie, if present
-        exp = None
-        try:
-            ck = self.sb.evaluate("document.cookie") or ""
-            for part in ck.split(";"):
-                if "ExperimentId=" in part:
-                    exp = part.split("ExperimentId=")[1].strip()
-        except Exception:
-            pass
-        h["experimentid"] = exp or str(uuid.uuid4())
-        return h
-
-    def fetch(self, url: str, timeout: int = 60):
-        js = (FETCH_JS.replace("__URL__", json.dumps(url))
-                      .replace("__HEADERS__", json.dumps(self.headers)))
-        try:
-            self.sb.evaluate(js)
-            for _ in range(timeout * 4):
-                raw = self.sb.evaluate("window.__nr ? JSON.stringify(window.__nr) : ''")
-                if raw:
-                    r = json.loads(raw)
-                    return r["status"], r["text"]
-                time.sleep(0.25)
-            return 0, "timeout waiting for fetch"
-        except Exception as e:
-            return 0, f"browser error: {e}"
+def parse_brands(facet) -> tuple:
+    brands, seen, skipped = [], set(), 0
+    for v in facet["values"]:
+        q = parse_qs((v.get("queryParam") or "").lstrip("&?"))
+        slug = (q.get("filterByBrand") or [None])[0]
+        if not slug or slug in seen:
+            skipped += 1
+            continue
+        seen.add(slug)
+        brands.append({"name": v.get("value"), "slug": slug, "count": v.get("productDisplayCount") or 0})
+    return brands, skipped
 
 
-# ── request layer ─────────────────────────────────────────────────────────
-def build_url(cfg, job, page: int) -> str:
-    params = [
-        ("top", cfg["page_size"]),
-        ("include", "ads"),
-        ("include", "enticements"),
-        ("breadcrumb", job["breadcrumb"]),
-        ("origin", "topnav"),
-        ("page", page),
-        ("isDynamicFacetsEnabled", "true"),
-    ]
-    for k, v in (job.get("extra_params") or {}).items():
-        for item in (v if isinstance(v, list) else [v]):
-            params.append((k, item))
-    return f"{cfg['site_url']}/sbn/v2/category/query/browse/{job['path']}?{urlencode(params)}"
-
-def get_page(sess: Session, cfg, url: str):
-    fails = 0
-    for attempt in range(1, cfg["max_retries"] + 1):
-        status, text = sess.fetch(url)
-        if status == 200:
-            try:
-                return json.loads(text)
-            except ValueError:
-                log_warn(f"HTTP 200 but not JSON (block page?): {text[:100]!r}")
-        elif status == 404:
-            log_err(f"404 for {url} - check the job's path/breadcrumb in config.json")
-            return None
-        else:
-            log_warn(f"HTTP {status}: {text[:120]!r}")
-        fails += 1
-        if fails >= cfg["restart_after_failures"]:
-            sess.restart()
-            fails = 0
-        wait = cfg["retry_delay"] * attempt + random.uniform(0, 3)
-        if status == 429:
-            wait *= 3
-        log_warn(f"Attempt {attempt}/{cfg['max_retries']} failed, retrying in {wait:.0f}s")
-        time.sleep(wait)
-    return None
-
-
-# ── product parsing ───────────────────────────────────────────────────────
+# ── product parsing + DBQ listing rows (unchanged from your phase2_listing.py) ─────
 def _rng(d, k):
     d = d or {}
     return d.get(k)
@@ -346,8 +262,6 @@ def export_csv(cfg):
             n += 1
     log_ok(f"Exported {n:,} rows -> {dst.name}")
 
-
-# ── main ──────────────────────────────────────────────────────────────────
 def load_seen_ids(jsonl: Path) -> set:
     seen = set()
     if jsonl.exists():
@@ -359,185 +273,422 @@ def load_seen_ids(jsonl: Path) -> set:
                     pass
     return seen
 
-def run_discover(sess, cfg, jobs):
-    out_dir = ROOT / cfg["output_dir"]
-    out_dir.mkdir(exist_ok=True)
-    for name, job in jobs.items():
-        data = get_page(sess, cfg, build_url(cfg, job, 1))
-        if data is None:
-            log_err(f"[{name}] discover failed")
+
+# ── URLs ──────────────────────────────────────────────────────────────────
+def brand_params(style, slugs):
+    if not slugs:
+        return []
+    if style == "repeat":
+        return [("filterByBrand", s) for s in slugs]
+    if style == "tilde":
+        return [("filterByBrand", "~".join(slugs))]
+    if style == "comma":
+        return [("filterByBrand", ",".join(slugs))]
+    raise ValueError(f"unknown group style {style!r}")
+
+def build_url(cfg, cat, page, slugs=None, style="repeat") -> str:
+    L, site = cfg["listing"], cfg["site"]["url"]
+    api = L["source"] == "api"
+    params = []
+    if api:
+        params += [("top", L.get("top") or 150), ("include", "ads"), ("include", "enticements")]
+    elif L.get("top"):
+        params.append(("top", L["top"]))
+    params += [("breadcrumb", cat["breadcrumb"]), ("origin", "topnav"), ("page", page)]
+    for k, v in (cat.get("extra_params") or {}).items():
+        for item in (v if isinstance(v, list) else [v]):
+            params.append((k, item))
+    params += brand_params(style, slugs)
+    if api:
+        params.append(("isDynamicFacetsEnabled", "true"))
+        base = f"{site}/sbn/v2/category/query/browse/{cat['path']}"
+    else:
+        base = f"{site}/browse/{cat['path']}"
+    return f"{base}?{urlencode(params)}"
+
+
+# ── one request ───────────────────────────────────────────────────────────
+async def fetch_listing(sess, cfg, url, tab=0, keep_facets=False, expect=None) -> Fetch:
+    L = cfg["listing"]
+    if L["source"] == "api":
+        return await sess.fetch_api(url, tab=tab, keep_facets=keep_facets)
+    return await sess.fetch_config(url, LISTING_JS, {"keys": L["config_keys"], "keepFacets": keep_facets},
+                                   tab=tab, expect=expect)
+
+def read_page(res: Fetch):
+    try:
+        data = json.loads(res.data)
+    except (TypeError, ValueError):
+        return None
+    return data if find_products(data) else None
+
+async def fetch_checked(sess, cfg, url, keep_facets=False, tab=0, expect=None, tries=None):
+    """One page with retries; used for planning requests. An empty page counts as a soft block."""
+    for _ in range(tries or cfg["listing"]["max_attempts"]):
+        res = await fetch_listing(sess, cfg, url, tab, keep_facets, expect)
+        data = None
+        if res.kind == "ok":
+            data = read_page(res)
+            if data is None:
+                res = Fetch("blocked", detail="empty page")
+        await sess.report(res)
+        if data is not None:
+            return data
+        if res.kind == "gone":
+            return None
+    return None
+
+
+# ── planning: how to cover a category ────────────────────────────────────
+def pack_groups(brands, max_products, max_brands):
+    """Greedy packing of brands (in facet order) into groups of <= max_products / max_brands.
+    A brand bigger than max_products stays alone (it gets a gap warning later)."""
+    groups, cur, size = [], [], 0
+    for b in brands:
+        if b["count"] > max_products:
+            if cur:
+                groups.append(cur)
+                cur, size = [], 0
+            groups.append([b])
             continue
+        if cur and (size + b["count"] > max_products or len(cur) >= max_brands):
+            groups.append(cur)
+            cur, size = [], 0
+        cur.append(b)
+        size += b["count"]
+    if cur:
+        groups.append(cur)
+    return groups
+
+async def verify_grouping(sess, cfg, cat, brands):
+    """Does a multi-brand filter return the SUM of the brands? -> working style or None."""
+    sample = [b for b in brands if 0 < b["count"] <= 800][:3] or brands[:3]
+    if len(sample) < 2:
+        return None
+    want = sum(b["count"] for b in sample)
+    for style in cfg["listing"]["group_styles"]:
+        url = build_url(cfg, cat, 1, [b["slug"] for b in sample], style)
+        data = await fetch_checked(sess, cfg, url, tries=3)
+        got = (find_first(data, "resultCount") or 0) if data else 0
+        log_info(f"grouping test '{style}': {len(sample)} brands expected {want:,} -> got {got:,}")
+        if data and abs(got - want) <= max(2, 0.02 * want):
+            return style
+    return None
+
+async def plan_category(sess, cfg, name, cat, args):
+    """-> (info, {partition_key: partition}, first_page_data_or_None)"""
+    L = cfg["listing"]
+    data = await fetch_checked(sess, cfg, build_url(cfg, cat, 1), keep_facets=True)
+    if data is None:
+        log_err(f"[{name}] could not load page 1 - run --discover to see what comes back")
+        return None
+    prods = find_products(data)
+    result_count = int(find_first(data, "resultCount") or 0)
+    page_count = int(find_first(data, "pageCount") or 1)
+    per_page = len(prods)
+    reach = page_count * per_page
+    info = {"result_count": result_count, "page_count": page_count, "per_page": per_page, "reach": reach}
+    log_info(f"[{name}] {result_count:,} products | {per_page} per page x {page_count} pages = reach {reach:,}")
+
+    def part(label, slugs, expected, style="repeat"):
+        return {"category": name, "label": label, "brands": slugs, "style": style, "expected": expected,
+                "page_count": None, "per_page": None, "result_count": None, "done_pages": [],
+                "fetched": 0, "done": False}
+
+    if not result_count or result_count <= reach:
+        info["mode"] = "unfiltered"
+        log_ok(f"[{name}] fits under the pagination cap -> unfiltered crawl")
+        return info, {f"{name}|all": part("all", None, result_count)}, data
+
+    facet = find_brand_facet(data)
+    if not facet:
+        log_err(f"[{name}] {result_count:,} products exceed the cap but no 'Brand' facet was found. "
+                f"Run --discover and send me output/discover_{name}.json. Crawling unfiltered (partial).")
+        info["mode"] = "unfiltered-partial"
+        return info, {f"{name}|all": part("all", None, result_count)}, data
+
+    brands, skipped = parse_brands(facet)
+    brands = [b for b in brands if b["count"] > 0]
+    if args.limit_brands:
+        brands = brands[:args.limit_brands]
+    total = sum(b["count"] for b in brands)
+    info.update({"brands": len(brands), "brand_total": total, "unbranded": max(result_count - total, 0)})
+    log_info(f"[{name}] {len(brands):,} brands cover {total:,} products "
+             f"({info['unbranded']:,} without a brand value are not reachable by brand filters)")
+
+    style = None
+    if L.get("group_brands", True) and not args.no_group:
+        style = await verify_grouping(sess, cfg, cat, brands)
+    parts = {}
+    if style:
+        max_products = int(reach * float(L["group_fill_ratio"]))
+        groups = pack_groups(brands, max_products, int(L["group_max_brands"]))
+        for i, g in enumerate(groups, 1):
+            parts[f"{name}|g{i:03d}"] = part(f"group {i} ({len(g)} brands)", [b["slug"] for b in g],
+                                             sum(b["count"] for b in g), style)
+        info["mode"] = f"grouped:{style}"
+        log_ok(f"[{name}] multi-brand filter works ('{style}') -> {len(groups)} partitions of <= {max_products:,} products")
+    else:
+        for i, b in enumerate(brands, 1):
+            parts[f"{name}|b{i:04d}"] = part(b["name"], [b["slug"]], b["count"])
+        info["mode"] = "per-brand"
+        log_warn(f"[{name}] multi-brand filters do not work -> {len(parts):,} single-brand partitions "
+                 f"(slower: every brand ends in a part-empty page)")
+    return info, parts, None
+
+
+# ── the crawl ─────────────────────────────────────────────────────────────
+class Listing:
+    def __init__(self, cfg, args, progress, seen, fh):
+        self.cfg, self.args, self.progress, self.seen, self.fh = cfg, args, progress, seen, fh
+        self.parts, self.gaps = progress["partitions"], progress["gaps"]
+        self.stats, self.queue = Counter(), TaskQueue()
+        self.t0, self.last_save, self.last_print = time.time(), time.time(), 0.0
+        self.prog_file = rpath(cfg, "listing_progress")
+        self.max_fails = int(cfg["listing"]["max_attempts"])
+        self.max_empty = int(cfg["listing"]["empty_page_retries"])
+
+    def save(self, force=False):
+        if force or time.time() - self.last_save >= 5:
+            save_json_atomic(self.prog_file, self.progress)
+            self.last_save = time.time()
+
+    def ingest(self, key, page, data):
+        """Write the page's products; the first page of a partition also queues pages 2..pageCount."""
+        P, site = self.parts[key], self.cfg["site"]["url"]
         prods = find_products(data)
-        dst = out_dir / f"discover_{name}.json"
-        dst.write_text(json.dumps(strip_products(data, prods), indent=2), encoding="utf-8")
-        log_ok(f"[{name}] pageCount={find_first(data, 'pageCount')} "
-               f"resultCount={find_first(data, 'resultCount')} products_on_page={len(prods)} -> {dst.name}")
-        # also save one raw product so we can see every available field
-        if prods:
-            sample = next(iter(prods.values()))
-            (out_dir / f"discover_{name}_sample_product.json").write_text(
-                json.dumps(sample, indent=2), encoding="utf-8")
-        time.sleep(cfg["delay"])
-
-def crawl_job(sess, cfg, name, job, st, prog_file, progress, jsonl, seen, args):
-    """Crawl one job. Sets st['done'] ONLY when we walk past the last page (page > pageCount).
-    An empty page before that is a soft block, not the end: retry with a fresh session
-    (next proxy); if it keeps coming back empty, stop WITHOUT marking done."""
-    head, page_size = f"[{name}]", cfg["page_size"]
-    page, pages_this_run, empties = st["next_page"], 0, 0
-    max_empty = cfg.get("empty_page_retries", 4)
-    while True:
-        if st["page_count"] and page > st["page_count"]:
-            st["done"] = True
-            break
-        if args.max_pages and pages_this_run >= args.max_pages:
-            log_info(f"{head} --max-pages reached")
-            break
-
-        data = get_page(sess, cfg, build_url(cfg, job, page))
-        if data is None:
-            log_err(f"{head} giving up on page {page}; progress saved, re-run to resume")
-            break
-
-        prods = find_products(data)
-        if not prods:
-            empties += 1
-            if empties > max_empty:
-                log_err(f"{head} page {page} still empty after {max_empty} fresh-session retries "
-                        f"(pageCount={st['page_count']}) -> stalled, NOT marked done; resumes here next run")
-                break
-            wait = 15 * empties + random.uniform(0, 5)
-            log_warn(f"{head} page {page} empty (pageCount={st['page_count']}) - looks like a soft block, "
-                     f"retry {empties}/{max_empty} with a fresh session in {wait:.0f}s")
-            sess.restart()
-            time.sleep(wait)
-            continue
-        empties = 0
-
+        if P["page_count"] is None:
+            P["page_count"] = int(find_first(data, "pageCount") or 1)
+            P["result_count"] = find_first(data, "resultCount")
+            P["per_page"] = len(prods)
+            reach = P["page_count"] * len(prods)
+            if P["result_count"] and P["result_count"] > reach:
+                self.gaps[key] = f"over pagination cap: {P['result_count']:,} > {reach:,} ({P['label']})"
+                log_warn(f"[{key}] {P['result_count']:,} products but pagination reaches ~{reach:,} "
+                         f"({P['label']}) - needs a second split")
+            for pg in range(2, P["page_count"] + 1):
+                if pg not in P["done_pages"]:
+                    self.queue.put({"key": key, "page": pg, "tries": 0, "empties": 0})
         ids_block = find_first(data, "productDisplayIds") or {}
-        organic = [str(i) for i in (ids_block.get("organic") or [])]
-        rank_of = {pid: i + 1 for i, pid in enumerate(organic)}
-
-        if st["page_count"] is None:
-            st["page_count"] = find_first(data, "pageCount")
-            st["result_count"] = find_first(data, "resultCount")
-            reachable = (st["page_count"] or 0) * page_size
-            log_info(f"{head} pageCount={st['page_count']} resultCount={st['result_count']}")
-            if st["result_count"] and reachable < st["result_count"]:
-                log_warn(f"{head} pagination only reaches ~{reachable:,} of "
-                         f"{st['result_count']:,} products. Add partition jobs "
-                         f"(filters/sorts via extra_params) - see --discover output.")
-
+        rank_of = {str(i): n + 1 for n, i in enumerate(ids_block.get("organic") or [])}
         now = datetime.now(timezone.utc).isoformat(timespec="seconds")
         new = 0
-        with open(jsonl, "a", encoding="utf-8") as f:
-            for pid, p in prods.items():
-                pid = str(pid)
-                if pid in seen:
-                    continue
-                rank = ((page - 1) * page_size + rank_of[pid]) if pid in rank_of else None
-                rec = parse_product(pid, p, cfg["site_url"], name, page, rank, pid in rank_of, now)
-                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-                seen.add(pid)
-                new += 1
+        for pid, prod in prods.items():
+            pid = str(pid)
+            if pid in self.seen:
+                continue
+            rank = ((page - 1) * (P["per_page"] or len(prods)) + rank_of[pid]) if pid in rank_of else None
+            rec = parse_product(pid, prod, site, P["category"], page, rank, pid in rank_of, now)
+            rec["brand_filter"] = ",".join(P["brands"]) if P["brands"] else None
+            self.fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            self.seen.add(pid)
+            new += 1
+        self.fh.flush()
+        if page not in P["done_pages"]:
+            P["done_pages"].append(page)
+        P["fetched"] += len(prods)
+        if len(P["done_pages"]) >= P["page_count"]:
+            P["done"] = True
+        return new
 
-        st["next_page"] = page + 1
-        save_json_atomic(prog_file, progress)
-        pages_this_run += 1
-        print(f"  {head} page {page}/{st['page_count']}  +{new} new "
-              f"({len(prods)} on page, {len(seen):,} total)", flush=True)
-        page += 1
-        time.sleep(random.uniform(cfg["delay"] * 0.8, cfg["delay"] * 1.3))
+    async def handle(self, task, sess, tab):
+        if self.args.max_pages and self.stats["pages"] >= self.args.max_pages:
+            return                                     # test mode: leave the rest for the next run
+        key, page = task["key"], task["page"]
+        P = self.parts[key]
+        if page in P["done_pages"]:
+            return
+        url = build_url(self.cfg, self.cfg["categories"][P["category"]], page, P["brands"], P["style"])
+        res = await fetch_listing(sess, self.cfg, url, tab, False, expect=f"page={page}" if page > 1 else None)
+        data = None
+        if res.kind == "ok":
+            data = read_page(res)
+            if data is None:                           # empty page: a soft block, NOT the end
+                res = Fetch("blocked", detail=f"empty page {page}")
+                task["empties"] += 1
+        await sess.report(res)
+        if data is not None:
+            new = self.ingest(key, page, data)
+            self.stats["pages"] += 1
+            self.stats["new"] += new
+            self.save()
+            self.tick()
+            return
+        task["tries"] += 1
+        self.stats["failed_requests"] += 1
+        if res.kind == "gone" or task["tries"] >= self.max_fails or task["empties"] > self.max_empty:
+            self.gaps[f"{key}|p{page}"] = f"{res.kind}: {res.detail or res.status}"
+            self.stats["stalled_pages"] += 1
+            log_err(f"[{key}] page {page} given up after {task['tries']} tries ({res.kind}); "
+                    f"NOT marked done - re-run to retry")
+        else:
+            self.queue.put(task)
 
-    save_json_atomic(prog_file, progress)
-    if st["done"]:
-        log_ok(f"{head} complete")
+    def tick(self):
+        if time.time() - self.last_print < 15:
+            return
+        self.last_print = time.time()
+        done = sum(1 for p in self.parts.values() if p["done"])
+        rate = self.stats["pages"] / max(time.time() - self.t0, 1)
+        remaining = sum(max((p["page_count"] or 1) - len(p["done_pages"]), 0) for p in self.parts.values()
+                        if not p["done"])
+        eta = remaining / rate / 60 if rate else 0
+        print(f"  progress: {done}/{len(self.parts)} partitions done | {len(self.seen):,} products | "
+              f"{self.stats['pages']} pages ({rate:.2f}/s) | failed requests {self.stats['failed_requests']} | "
+              f"~{remaining} pages left, ETA ~{eta:.0f} min", flush=True)
 
-def run_jobs(sess, cfg, jobs, args):
-    jsonl, prog_file = rpath(cfg, "listing_jsonl"), rpath(cfg, "progress_file")
-    today_s = datetime.now().strftime("%Y-%m-%d")
-    progress = json.loads(prog_file.read_text()) if prog_file.exists() else {"jobs": {}}
-    stale = cfg.get("auto_reset_daily", True) and progress.get("run_date") not in (None, today_s)
+    def initial_tasks(self, categories):
+        n = 0
+        for key, P in self.parts.items():
+            if P["done"] or P["category"] not in categories:
+                continue
+            if P["page_count"] is None:
+                self.queue.put({"key": key, "page": 1, "tries": 0, "empties": 0})
+                n += 1
+            else:
+                for pg in range(1, P["page_count"] + 1):
+                    if pg not in P["done_pages"]:
+                        self.queue.put({"key": key, "page": pg, "tries": 0, "empties": 0})
+                        n += 1
+        return n
+
+
+async def run_listing(cfg, args):
+    jsonl, prog_file = rpath(cfg, "listing_jsonl"), rpath(cfg, "listing_progress")
+    progress = load_json(prog_file, {}) or {}
+    stale = cfg["listing"].get("auto_reset_daily", True) and progress.get("run_date") not in (None, today())
     if args.fresh or stale:
         if stale:
             log_info("New day: starting a fresh listing run")
         for p in (jsonl, prog_file):
-            if p.exists():
-                p.unlink()
-        progress = {"jobs": {}}
-    progress["run_date"] = today_s
-
-    if args.reopen:   # undo a wrongly-set done flag
-        for n in (list(jobs) if args.reopen == "all" else [args.reopen]):
-            if n in progress["jobs"]:
-                progress["jobs"][n]["done"] = False
-                log_info(f"[{n}] reopened, resumes at page {progress['jobs'][n]['next_page']}")
-    save_json_atomic(prog_file, progress)
-
+            p.unlink(missing_ok=True)
+        progress = {}
+    progress["run_date"] = today()
+    for k in ("plan", "partitions", "gaps"):
+        progress.setdefault(k, {})
+    categories = [n for n in cfg["categories"] if not args.category or n == args.category]
+    if not categories:
+        raise SystemExit(f"Unknown category {args.category!r}. Available: {', '.join(cfg['categories'])}")
+    if args.reopen:
+        for key, P in progress["partitions"].items():
+            if args.reopen in ("all", key, P["category"]):
+                P["done"] = False
     seen = load_seen_ids(jsonl)
-    log_info(f"Resuming with {len(seen):,} products already saved")
-    for name in jobs:
-        progress["jobs"].setdefault(name, {"next_page": 1, "page_count": None,
-                                           "result_count": None, "done": False})
+    log_info(f"{len(seen):,} products already saved | source: {cfg['listing']['source']}")
 
-    rounds = cfg.get("job_rounds", 3)
-    for rnd in range(1, rounds + 1):
-        todo = [n for n in jobs if not progress["jobs"][n]["done"]]
-        if not todo:
-            break
-        if rnd > 1:
-            log_warn(f"Round {rnd}/{rounds}: incomplete jobs {todo}; new session in 60s")
-            time.sleep(60)
-            sess.restart()
-        for name in todo:
-            crawl_job(sess, cfg, name, jobs[name], progress["jobs"][name], prog_file,
-                      progress, jsonl, seen, args)
-        if args.max_pages:
-            break
+    fh = open(jsonl, "a", encoding="utf-8")
+    state = Listing(cfg, args, progress, seen, fh)
+    try:
+        async with Crawler(cfg) as crawler:
+            sess = crawler.sessions[0]
+            for name in categories:
+                if name in progress["plan"]:
+                    continue
+                planned = await plan_category(sess, cfg, name, cfg["categories"][name], args)
+                if planned is None:
+                    continue
+                info, parts, first = planned
+                progress["plan"][name] = info
+                progress["partitions"].update(parts)
+                if first is not None:                  # page 1 is already in hand
+                    state.ingest(f"{name}|all", 1, first)
+                state.save(force=True)
+            n = state.initial_tasks(categories)
+            est = sum(max((p["page_count"] or math.ceil(p["expected"] / max(
+                    progress["plan"][p["category"]]["per_page"], 1))) - len(p["done_pages"]), 0)
+                      for p in state.parts.values() if not p["done"] and p["category"] in categories)
+            log_info(f"{n} queued tasks (~{est:,} pages to fetch) | {crawler.n} browser(s) x {crawler.tabs} tab(s)")
+            if n:
+                await crawler.run(state.queue, state.handle)
+    finally:
+        fh.close()
+        state.save(force=True)
 
-    for n in jobs:
-        st = progress["jobs"][n]
-        state = "DONE" if st["done"] else f"INCOMPLETE (next page {st['next_page']}/{st['page_count']})"
-        (log_ok if st["done"] else log_warn)(f"[{n}] {state}")
+    # ── report ──
+    for key, P in state.parts.items():
+        if P["done"] and P["expected"] and P["fetched"] < 0.9 * P["expected"] and key not in state.gaps:
+            state.gaps[key] = f"fetched {P['fetched']:,} of ~{P['expected']:,} expected ({P['label']})"
+    state.save(force=True)
+    counts = Counter()
+    if jsonl.exists():
+        with open(jsonl, encoding="utf-8") as f:
+            for line in f:
+                counts[json.loads(line).get("job")] += 1
+    open_parts = [k for k, P in state.parts.items() if not P["done"] and P["category"] in categories]
+    log_ok(f"{sum(counts.values()):,} unique products saved ({', '.join(f'{c}: {n:,}' for c, n in counts.items())})")
+    (log_warn if open_parts else log_ok)(
+        f"{len(state.parts) - len(open_parts):,}/{len(state.parts):,} partitions complete"
+        + (f"; {len(open_parts)} unfinished - re-run to resume" if open_parts else ""))
+    if state.gaps:
+        (ROOT / cfg["files"]["listing_gaps"]).parent.mkdir(parents=True, exist_ok=True)
+        (ROOT / cfg["files"]["listing_gaps"]).write_text(json.dumps(state.gaps, indent=2), encoding="utf-8")
+        log_warn(f"{len(state.gaps)} gap(s) -> {cfg['files']['listing_gaps']}")
+
+
+async def run_discover(cfg, args):
+    out_dir = ROOT / cfg["output_dir"]
+    out_dir.mkdir(exist_ok=True)
+    async with Crawler(cfg, workers=1) as crawler:
+        sess = crawler.sessions[0]
+        for name, cat in cfg["categories"].items():
+            if args.category and name != args.category:
+                continue
+            url = build_url(cfg, cat, 1)
+            log_info(f"[{name}] {cfg['listing']['source']} -> {url}")
+            res = await fetch_listing(sess, cfg, url, 0, True)
+            await sess.report(res)
+            if res.kind != "ok":
+                log_err(f"[{name}] discover failed: {res.kind} {res.detail or res.status}")
+                continue
+            data = json.loads(res.data)
+            container, path = locate_products(data)
+            prods = find_products(data)
+            dst = out_dir / f"discover_{name}.json"
+            dst.write_text(json.dumps(strip_products(data, container), indent=2), encoding="utf-8")
+            if prods:
+                (out_dir / f"discover_{name}_sample_product.json").write_text(
+                    json.dumps(next(iter(prods.values())), indent=2), encoding="utf-8")
+            facets = find_facets(data)
+            brand = find_brand_facet(data)
+            log_ok(f"[{name}] products_on_page={len(prods)} (found at {path}) | "
+                   f"pageCount={find_first(data, 'pageCount')} resultCount={find_first(data, 'resultCount')} | "
+                   f"Brand facet: {len(brand['values']) if brand else 'NOT FOUND'} values")
+            print(f"    config keys: {list(data)[:12]}")
+            print(f"    facets: {facets[:12]}")
+            print(f"    saved {dst.name}" + (" + sample product" if prods else ""))
+
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default=str(ROOT / "config.json"))
-    ap.add_argument("--job", help="run a single job from config.json (e.g. women)")
+    ap.add_argument("--category", help="only this category (e.g. women)")
     ap.add_argument("--fresh", action="store_true", help="ignore progress and delete output")
-    ap.add_argument("--max-pages", type=int, default=0, help="limit pages per job (testing)")
-    ap.add_argument("--discover", action="store_true", help="fetch page 1 and dump facets/structure")
-    ap.add_argument("--reopen", help="job name or 'all': set done=false so it resumes")
-    ap.add_argument("--export-csv", action="store_true", help="only rebuild the CSV from the JSONL")
+    ap.add_argument("--reopen", help="'all', a category or a partition key: set done=false")
+    ap.add_argument("--max-pages", type=int, default=0, help="stop after N pages this run (testing)")
+    ap.add_argument("--limit-brands", type=int, default=0, help="only the first N brands per category (testing)")
+    ap.add_argument("--no-group", action="store_true", help="never pack brands into groups")
+    ap.add_argument("--top", type=int, help="override listing.top (items per request)")
+    ap.add_argument("--source", choices=["page", "api"], help="override listing.source")
+    ap.add_argument("--discover", action="store_true", help="dump page-1 structure and facets per category")
+    ap.add_argument("--export-csv", action="store_true", help="only rebuild listing.csv from the JSONL")
     args = ap.parse_args()
 
-    cfg = load_config(Path(args.config))
+    cfg = load_config(args.config)
+    if args.top is not None:
+        cfg["listing"]["top"] = args.top
+    if args.source:
+        cfg["listing"]["source"] = args.source
     if args.export_csv:
         export_csv(cfg)
         return
-
-    jobs = cfg["jobs"]
-    if args.job:
-        if args.job not in jobs:
-            log_err(f"Unknown job {args.job!r}. Available: {', '.join(jobs)}")
-            sys.exit(1)
-        jobs = {args.job: jobs[args.job]}
-
-    if proxy_list():
-        check_proxies()
-    sess = Session(cfg)
-    sess.start()
+    log_head("Phase 1 - listing")
     try:
-        if args.discover:
-            run_discover(sess, cfg, jobs)
-        else:
-            run_jobs(sess, cfg, jobs, args)
-            export_csv(cfg)
+        asyncio.run(run_discover(cfg, args) if args.discover else run_listing(cfg, args))
     except KeyboardInterrupt:
         log_warn("Interrupted - progress saved, re-run to resume")
-        export_csv(cfg)
     finally:
-        sess.stop()
+        if not args.discover:
+            export_csv(cfg)
 
 if __name__ == "__main__":
     main()

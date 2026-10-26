@@ -1,3 +1,4 @@
-seleniumbase
+cloakbrowser>=0.5.12      # stealth Chromium (free binary = 1 concurrent session)
+curl_cffi                 # only for phase3/phase4 helpers and other projects; not used by phases 1-2
 python-dotenv
-curl_cffi
+boto3                     # phase4 upload

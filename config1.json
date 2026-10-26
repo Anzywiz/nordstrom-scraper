@@ -1,0 +1,84 @@
+{
+  "input_csv": "output/listing.csv",
+  "site_url": "https://www.nordstrom.com",
+  "output_dir": "output",
+  "listing_jsonl": "output/products_listing.jsonl",
+  "listing_csv": "output/listing.csv",
+  "progress_file": "output/phase1_progress.json",
+  "auto_reset_daily": true,
+  "page_size": 200,
+  "delay": 2.0,
+  "max_retries": 5,
+  "retry_delay": 6,
+  "restart_after_failures": 2,
+  "headless": false,
+  "warmup_path": "/",
+  "warmup_seconds": 10,
+  "fetch_mode": "auto",
+  "impersonate": "chrome",
+  "workers": 16,
+  "browser_concurrency": 8,
+  "batch_size": 400,
+  "request_timeout": 30,
+  "max_attempts": 3,
+  "remint_every_batches": 25,
+  "products_csv": "output/products.csv",
+  "phase2_done_file": "output/phase2_done.txt",
+  "phase2_run_file": "output/phase2_run.json",
+  "phase2_failed_file": "output/phase2_failed.txt",
+  "fixed_values": {
+    "dbq_prd_type": "E0005",
+    "website_name": "Nordstrom",
+    "country_code": "USA",
+    "currency_code": "USD",
+    "store_url": "https://www.nordstrom.com",
+    "contract_id": "",
+    "seller_id": "AKIAS3CAQLRANRVQRKGO"
+  },
+  "jobs": {
+    "women": {
+      "path": "women",
+      "breadcrumb": "Home/Women",
+      "extra_params": {}
+    },
+    "men": {
+      "path": "men",
+      "breadcrumb": "Home/Men",
+      "extra_params": {}
+    },
+    "kids": {
+      "path": "kids",
+      "breadcrumb": "Home/Kids",
+      "extra_params": {}
+    }
+  },
+  "headers": {
+    "accept": "*/*",
+    "content-type": "application/json",
+    "cardmember": "Non-CardMember",
+    "customerauthstate": "anonymous",
+    "eventsource": "{\"channel\":\"FULL_LINE\",\"channelCountry\":\"US\",\"platform\":\"WEB\"}",
+    "goku": "1",
+    "is-security-scan": "false",
+    "loyaltylevel": "non-member",
+    "nord-api-key": "xlpykt3z40g7od7yc94bj1cqv5959hkr",
+    "nord-authentication-status": "UNRECOGNIZED",
+    "nord-channel-brand": "NORDSTROM",
+    "nord-client-id": "APP01196",
+    "nord-country-code": "US",
+    "nord-customer-experience": "DESKTOP_WEB"
+  },
+  "nav_workers": 4,
+  "empty_page_retries": 4,
+  "job_rounds": 3,
+
+  "upload": {
+  "aws_region": "us-east-1",
+  "s3_bucket": "databoutique.com",
+  "delivery_path": "sellers/AKIAS3CAQLRANRVQRKGO/rec04fgyagW4yZTzx",
+  "local_file": "output/data_file.txt",
+  "check_interval_seconds": 30,
+  "timeout_minutes": 30
+  }
+
+}

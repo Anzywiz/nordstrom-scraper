@@ -2,42 +2,38 @@
 """
 Phase 2 - PDP enrichment -> output/products.csv (DBQ E0005, one row per colour x size).
 
-Reads output/products_listing.jsonl (phase 1), opens every product page and reads the
-JSON in <script>window.__INITIAL_CONFIG__ = {...}.
+Reads output/listing.jsonl (phase 1), opens every product page in CloakBrowser and reads
+window.__INITIAL_CONFIG__ straight from the page. Parsing (sizes, quantities, categories, ...) is
+your previous parse_payload(), unchanged.
 
-Fetch modes (config "fetch_mode" / --mode):
-  curl    - browser mints cookies once, curl_cffi threads fetch HTML.        fastest
-  browser - one browser, concurrent fetch() inside the page.                 fast
-  nav     - several real browsers (processes) that NAVIGATE to each PDP and  slowest,
-            read window.__INITIAL_CONFIG__ directly.                         most robust
-  auto    - probe curl -> browser -> nav and use the first that works.
+Why only navigation: on this machine curl_cffi (even with the browser's cookies) and in-page XHR
+never received the real PDP; real navigations from CloakBrowser did (10/10). Speed therefore comes
+from parallelism: browser.workers x browser.tabs_per_browser pages at once, and from stopping each
+page load as soon as the config script has run.
 
-Debug helpers:
-  --dump-url URL   save the full __INITIAL_CONFIG__ to output/debug_<id>.json and print
-                   where "breadcrumb" etc. live (send me this file if fields look wrong)
-  --test-url URL   fetch + parse one PDP and print the first row
+Daily refresh: run phase 1, then phase 2, every day. Both reset themselves when the date changes
+and resume within the same day.
 
-Daily refresh: run phase1 then phase2 each day; both reset themselves when the date
-changes and resume within the same day.
+Usage:
+    python phase2_enrich.py --test-url https://www.nordstrom.com/s/<slug>/<id>   # one PDP, prints first row
+    python phase2_enrich.py --dump-url  https://www.nordstrom.com/s/<slug>/<id>  # save the full config
+    python phase2_enrich.py --limit 20            # smoke test
+    python phase2_enrich.py                       # everything, resumes automatically
+    python phase2_enrich.py --job women           # one category only
+    python phase2_enrich.py --fresh               # start a clean products.csv
 """
 import argparse
+import asyncio
 import csv
 import json
-import os
-import queue
-import random
 import re
-import threading
 import time
-from collections import Counter, deque
-from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
+from collections import Counter
 
-from common import (COLUMNS, ROOT, build_base_row, check_proxies, close_browser, get_cookies,
-                    json_list_capped, load_config, log_err, log_info, log_ok, log_warn, next_proxy,
-                    open_browser, proxy_for_curl, proxy_label, proxy_list, rpath, today)
+from nord_browser import PDP_JS, Crawler, Fetch, TaskQueue
+from nord_core import (COLUMNS, ROOT, build_base_row, json_list_capped, load_config, log_err, log_head,
+                       log_info, log_ok, log_warn, rpath, today)
 
-MARK = "window.__INITIAL_CONFIG__"
 MATERIAL_RE = re.compile(
     r"\b(cotton|polyester|nylon|wool|silk|linen|leather|suede|cashmere|viscose|rayon|spandex|"
     r"elastane|acrylic|lyocell|modal|denim|velvet|satin|textile|fabric|canvas|rubber|metal|"
@@ -45,47 +41,9 @@ MATERIAL_RE = re.compile(
     r"steel|titanium|crystal|glass)\b|\d+\s?%", re.I)
 
 
-# ── PDP JSON extraction / parsing ─────────────────────────────────────────
+# ── PDP parsing (unchanged) ───────────────────────────────────────────────
 def product_id_from(url: str) -> str:
     return url.rstrip("/").split("?")[0].split("/")[-1]
-
-def find_breadcrumb(cfg):
-    """The breadcrumb is not on the product entity itself; search the whole config
-    (productDisplay first)."""
-    def dfs(o, depth=0):
-        if depth > 14:
-            return None
-        if isinstance(o, dict):
-            b = o.get("breadcrumb")
-            if isinstance(b, list) and b and isinstance(b[0], dict) and b[0].get("name"):
-                return b
-            for v in o.values():
-                r = dfs(v, depth + 1)
-                if r:
-                    return r
-        elif isinstance(o, list):
-            for v in o:
-                r = dfs(v, depth + 1)
-                if r:
-                    return r
-        return None
-    return dfs(cfg.get("productDisplay") or {}) or dfs(cfg)
-
-def extract_payload(html: str, pid: str):
-    """-> ({'ent':..., 'bc':...} | None, err)"""
-    i = html.find(MARK)
-    if i < 0:
-        return None, "no config"
-    j = html.find("{", i)
-    try:
-        cfg, _ = json.JSONDecoder().raw_decode(html, j)
-    except ValueError:
-        return None, "bad json"
-    ents = ((cfg.get("productDisplay") or {}).get("productDisplaysById") or {}).get("entities") or {}
-    ent = ents.get(pid) or next(iter(ents.values()), None)
-    if not ent:
-        return None, "no entity"
-    return {"ent": ent, "bc": find_breadcrumb(cfg)}, ""
 
 def _first(lst):
     return (lst or [{}])[0] or {}
@@ -186,315 +144,6 @@ def parse_payload(payload: dict, url: str, base: dict) -> list:
     return rows
 
 
-# ── JS used in the browser-based modes ────────────────────────────────────
-# slim(cfg, id) -> JSON string {ent, bc} with the heavy per-store availability stripped
-SLIM_JS = r"""
-function slim(cfg, id) {
-  const strip = (k, v) => (k === 'fulfillmentChannels' || k === 'services' || k === 'nodes') ? undefined : v;
-  const ents = ((cfg.productDisplay || {}).productDisplaysById || {}).entities || {};
-  const ent = ents[id] || Object.values(ents)[0];
-  if (!ent) return '';
-  let bc = null;
-  const dfs = (o, d) => {
-    if (bc || !o || typeof o !== 'object' || d > 14) return;
-    if (Array.isArray(o)) { for (const x of o) dfs(x, d + 1); return; }
-    if (Array.isArray(o.breadcrumb) && o.breadcrumb.length && o.breadcrumb[0] && o.breadcrumb[0].name) { bc = o.breadcrumb; return; }
-    for (const k in o) dfs(o[k], d + 1);
-  };
-  dfs(cfg.productDisplay || {}, 0);
-  if (!bc) dfs(cfg, 0);
-  return JSON.stringify({ent: ent, bc: bc}, strip);
-}
-"""
-
-BATCH_JS = SLIM_JS + r"""
-(function () {
-  window.__b = null;
-  const urls = __URLS__;
-  const one = async (u) => {
-    try {
-      const r = await fetch(u, {credentials: 'include', headers: {'accept': 'text/html,application/xhtml+xml'}});
-      if (r.status !== 200) return {u: u, s: r.status, d: null, e: ''};
-      const t = await r.text();
-      const m = t.match(/window\.__INITIAL_CONFIG__\s*=\s*(\{[\s\S]*?\})\s*;?\s*<\/script>/);
-      if (!m) return {u: u, s: 200, d: null, e: 'no config'};
-      const id = u.split('?')[0].replace(/\/$/, '').split('/').pop();
-      const d = slim(JSON.parse(m[1]), id);
-      return {u: u, s: 200, d: d || null, e: d ? '' : 'no entity'};
-    } catch (e) { return {u: u, s: 0, d: null, e: String(e).slice(0, 80)}; }
-  };
-  Promise.all(urls.map(one)).then(res => { window.__b = res; });
-  return true;
-})()
-"""
-
-NAV_JS = SLIM_JS + r"""
-(function () { try { return slim(window.__INITIAL_CONFIG__, __ID__) || ''; } catch (e) { return ''; } })()
-"""
-NAV_STATE_JS = ("(document.title||'').indexOf('Access Denied')>=0 ? 'D' : "
-                "(typeof window.__INITIAL_CONFIG__ !== 'undefined' ? 'R' : '')")
-
-
-# ── fetchers ──────────────────────────────────────────────────────────────
-# fetch_batch(urls) -> list of (status, payload|None, err) aligned with urls
-class CurlFetcher:
-    name = "curl"
-
-    def __init__(self, cfg, sample_url):
-        self.cfg, self.sample_url = cfg, sample_url
-        self.batch_size = cfg["batch_size"]
-        self.cookies, self.tl, self.proxies = {}, threading.local(), None
-        self.pool = ThreadPoolExecutor(max_workers=cfg["workers"])
-
-    def start(self):
-        self.remint()
-
-    def remint(self):
-        proxy = next_proxy()
-        log_info(f"Minting session cookies via browser (proxy: {proxy_label(proxy)})...")
-        sb = open_browser(self.cfg, proxy)
-        try:
-            sb.goto(self.cfg["site_url"] + self.cfg.get("warmup_path", "/"))
-            time.sleep(self.cfg.get("warmup_seconds", 10))
-            if self.sample_url:
-                sb.goto(self.sample_url)
-                time.sleep(6)
-            self.cookies = get_cookies(sb)
-        finally:
-            close_browser(sb)
-        # cookies are tied to the IP: fetch through the SAME proxy used to mint them
-        self.proxies = {"http": proxy_for_curl(proxy), "https": proxy_for_curl(proxy)} if proxy else None
-        self.tl = threading.local()
-        log_ok(f"Got {len(self.cookies)} cookies")
-
-    def stop(self):
-        self.pool.shutdown(wait=False, cancel_futures=True)
-
-    def _one(self, url):
-        from curl_cffi import requests as cr
-        s = getattr(self.tl, "s", None)
-        if s is None:
-            s = self.tl.s = cr.Session(impersonate=self.cfg.get("impersonate", "chrome"))
-        for attempt in range(2):
-            try:
-                r = s.get(url, cookies=self.cookies, proxies=self.proxies,
-                          timeout=self.cfg["request_timeout"],
-                          headers={"accept": "text/html,application/xhtml+xml,*/*;q=0.8",
-                                   "accept-language": "en-US,en;q=0.9"})
-            except Exception as e:
-                if attempt == 0:
-                    time.sleep(1.5)
-                    continue
-                return 0, None, str(e)[:60]
-            if r.status_code in (429, 500, 502, 503, 504) and attempt == 0:
-                time.sleep(random.uniform(3, 6))
-                continue
-            if r.status_code != 200:
-                return r.status_code, None, ""
-            payload, err = extract_payload(r.text, product_id_from(url))
-            return 200, payload, err
-        return 0, None, "retry exhausted"
-
-    def fetch_batch(self, urls):
-        return list(self.pool.map(self._one, urls))
-
-
-class BrowserFetcher:
-    name = "browser"
-
-    def __init__(self, cfg, sample_url):
-        self.cfg, self.sb = cfg, None
-        self.batch_size = cfg["batch_size"]
-
-    def start(self):
-        self.stop()
-        proxy = next_proxy()
-        log_info(f"Opening browser session (proxy: {proxy_label(proxy)})...")
-        self.sb = open_browser(self.cfg, proxy)
-        self.sb.goto(self.cfg["site_url"] + self.cfg.get("warmup_path", "/"))
-        time.sleep(self.cfg.get("warmup_seconds", 10))
-        log_ok("Browser session ready")
-
-    def remint(self):
-        time.sleep(random.uniform(2, 5))
-        self.start()
-
-    def stop(self):
-        if self.sb:
-            close_browser(self.sb)
-            self.sb = None
-
-    def _run_chunk(self, urls):
-        try:
-            self.sb.evaluate(BATCH_JS.replace("__URLS__", json.dumps(urls)))
-            for _ in range(self.cfg["request_timeout"] * 4 * 3):
-                raw = self.sb.evaluate("window.__b ? JSON.stringify(window.__b) : ''")
-                if raw:
-                    return {r["u"]: r for r in json.loads(raw)}
-                time.sleep(0.25)
-        except Exception as e:
-            return {u: {"s": 0, "d": None, "e": f"browser error: {str(e)[:50]}"} for u in urls}
-        return {u: {"s": 0, "d": None, "e": "timeout"} for u in urls}
-
-    def fetch_batch(self, urls):
-        c, out = self.cfg["browser_concurrency"], {}
-        for i in range(0, len(urls), c):
-            out.update(self._run_chunk(urls[i:i + c]))
-        res = []
-        for u in urls:
-            r = out.get(u) or {"s": 0, "d": None, "e": "missing"}
-            res.append((r["s"], json.loads(r["d"]) if r.get("d") else None, r.get("e") or ""))
-        return res
-
-
-def nav_worker(cfg, idx, in_q, out_q):
-    """Process: own browser, navigates to each PDP and reads window.__INITIAL_CONFIG__."""
-    sb, boots = None, 0
-
-    def boot():
-        nonlocal sb, boots
-        if sb:
-            close_browser(sb)
-        pl = cfg.get("_proxies") or proxy_list()
-        proxy = pl[(idx + boots) % len(pl)] if pl else None
-        boots += 1
-        sb = open_browser(cfg, proxy)
-        sb.goto(cfg["site_url"] + cfg.get("warmup_path", "/"))
-        time.sleep(cfg.get("warmup_seconds", 10))
-
-    boot()
-    bad = 0
-    while True:
-        url = in_q.get()
-        if url is None:
-            break
-        pid = product_id_from(url)
-        status, raw, err = 0, None, "timeout"
-        try:
-            sb.goto(url)
-            t_end = time.time() + cfg["request_timeout"]
-            while time.time() < t_end:
-                st = sb.evaluate(NAV_STATE_JS)
-                if st == "D":
-                    status, err = 403, ""
-                    break
-                if st == "R":
-                    raw = sb.evaluate(NAV_JS.replace("__ID__", json.dumps(pid)))
-                    status, err = 200, ("" if raw else "no entity")
-                    break
-                time.sleep(0.4)
-        except Exception as e:
-            status, err = 0, str(e)[:60]
-        out_q.put((url, status, raw or None, err))
-        bad = bad + 1 if status in (0, 403) else 0
-        if bad >= 3:                      # blocked repeatedly: new browser (+ next proxy)
-            try:
-                boot()
-            except Exception:
-                pass
-            bad = 0
-    close_browser(sb)
-
-
-class NavFetcher:
-    name = "nav"
-
-    def __init__(self, cfg, sample_url):
-        self.cfg, self.procs = cfg, []
-        self.batch_size = cfg["nav_workers"] * 25
-
-    def start(self):
-        import multiprocessing as mp
-        ctx = mp.get_context("spawn")
-        self.in_q, self.out_q = ctx.Queue(), ctx.Queue()
-        n = self.cfg["nav_workers"]
-        self.cfg["_proxies"] = proxy_list()
-        log_info(f"Starting {n} navigation browsers (each takes ~15s to warm up)...")
-        for i in range(n):
-            p = ctx.Process(target=nav_worker, args=(self.cfg, i, self.in_q, self.out_q), daemon=True)
-            p.start()
-            self.procs.append(p)
-
-    def stop(self):
-        for _ in self.procs:
-            try:
-                self.in_q.put(None)
-            except Exception:
-                pass
-        for p in self.procs:
-            p.join(timeout=10)
-            if p.is_alive():
-                p.terminate()
-        self.procs = []
-
-    def remint(self):
-        self.stop()
-        time.sleep(3)
-        self.start()
-
-    def fetch_batch(self, urls):
-        for u in urls:
-            self.in_q.put(u)
-        res = {}
-        n = max(len(self.procs), 1)
-        deadline = time.time() + (len(urls) / n) * self.cfg["request_timeout"] * 1.5 + 90
-        while len(res) < len(urls) and time.time() < deadline:
-            try:
-                u, s, raw, e = self.out_q.get(timeout=5)
-            except queue.Empty:
-                continue
-            res[u] = (s, json.loads(raw) if raw else None, e)
-        return [res.get(u, (0, None, "lost")) for u in urls]
-
-
-FETCHERS = {"curl": CurlFetcher, "browser": BrowserFetcher, "nav": NavFetcher}
-
-
-# ── debug dump ────────────────────────────────────────────────────────────
-def dump_url(cfg, url):
-    pid = product_id_from(url)
-    proxy = next_proxy()
-    sb = open_browser(cfg, proxy)
-    try:
-        sb.goto(cfg["site_url"] + "/")
-        time.sleep(cfg.get("warmup_seconds", 10))
-        sb.goto(url)
-        for _ in range(60):
-            if sb.evaluate("typeof window.__INITIAL_CONFIG__ !== 'undefined' ? 1 : 0"):
-                break
-            time.sleep(0.5)
-        raw = sb.evaluate("JSON.stringify(window.__INITIAL_CONFIG__ || null)")
-        title = sb.evaluate("document.title")
-    finally:
-        close_browser(sb)
-    if not raw or raw == "null":
-        log_err(f"No __INITIAL_CONFIG__ found (page title: {title!r})")
-        return
-    cfg_json = json.loads(raw)
-    out = ROOT / cfg["output_dir"] / f"debug_{pid}.json"
-    out.parent.mkdir(exist_ok=True)
-    out.write_text(json.dumps(cfg_json, indent=1), encoding="utf-8")
-    log_ok(f"Saved {out}  (page title: {title!r})")
-    print("top-level keys:", list(cfg_json))
-    ents = ((cfg_json.get("productDisplay") or {}).get("productDisplaysById") or {}).get("entities") or {}
-    ent = ents.get(pid) or next(iter(ents.values()), {})
-    print("entity keys:", list(ent))
-
-    paths = []
-    def walk(o, path=""):
-        if isinstance(o, dict):
-            for k, v in o.items():
-                if k == "breadcrumb":
-                    paths.append(path + "/" + k)
-                walk(v, path + "/" + k)
-        elif isinstance(o, list):
-            for i, v in enumerate(o[:50]):
-                walk(v, f"{path}[{i}]")
-    walk(cfg_json)
-    print("breadcrumb found at:", paths or "NOWHERE")
-    print("breadcrumb picked :", [b.get("name") for b in (find_breadcrumb(cfg_json) or [])])
-
-
 # ── run ───────────────────────────────────────────────────────────────────
 def load_items(cfg, job):
     src = rpath(cfg, "listing_jsonl")
@@ -511,66 +160,95 @@ def load_items(cfg, job):
                 items.append((r["product_id"], r["url"]))
     return items
 
-def choose_fetcher(mode, cfg, sample_url, probe_urls):
-    if mode != "auto":
-        f = FETCHERS[mode](cfg, sample_url)
-        f.start()
-        return f
-    for name in ("curl", "browser", "nav"):
-        f = FETCHERS[name](cfg, sample_url)
-        f.start()
-        res = f.fetch_batch(probe_urls)
-        ok = sum(1 for _, p, _ in res if p)
-        log_info(f"probe {name}: {ok}/{len(probe_urls)} ok  "
-                 f"({dict(Counter(f'{s}:{e}' if e else str(s) for s, _, e in res))})")
-        if ok >= max(2, len(probe_urls) // 2):
-            return f
-        f.stop()
-        log_warn(f"{name} mode blocked, trying next")
-    raise SystemExit("All fetch modes blocked. Try a proxy (PROXY_LIST) or run --dump-url to inspect.")
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--config", default=str(ROOT / "config.json"))
-    ap.add_argument("--job")
-    ap.add_argument("--mode", choices=["auto", "curl", "browser", "nav"])
-    ap.add_argument("--fresh", action="store_true")
-    ap.add_argument("--limit", type=int, default=0)
-    ap.add_argument("--test-url")
-    ap.add_argument("--dump-url")
-    args = ap.parse_args()
+class Enrich:
+    def __init__(self, cfg, args, base, writer, csv_f, done_f, total):
+        self.cfg, self.args, self.base = cfg, args, base
+        self.writer, self.csv_f, self.done_f, self.total = writer, csv_f, done_f, total
+        self.E = cfg["enrich"]
+        self.stats, self.failed, self.queue = Counter(), [], TaskQueue()
+        self.t0, self.last_print, self.since_flush = time.time(), 0.0, 0
 
-    cfg = load_config(Path(args.config))
-    mode = args.mode or cfg.get("fetch_mode", "auto")
-    base = build_base_row(cfg)
-    if proxy_list():
-        check_proxies()
+    def finish_ok(self, pid, rows):
+        self.writer.writerows(rows)
+        self.done_f.write(pid + "\n")
+        self.stats["ok"] += 1
+        self.stats["rows"] += len(rows)
+        self.since_flush += 1
+        if self.since_flush >= int(self.E["flush_every"]):
+            self.flush()
 
-    if args.dump_url:
-        dump_url(cfg, args.dump_url)
-        return
+    def finish_gone(self, pid):
+        self.done_f.write(pid + "\n")
+        self.stats["gone"] += 1
+        self.since_flush += 1
 
-    if args.test_url:
-        m = "browser" if mode == "auto" else mode
-        cfg["nav_workers"] = 1
-        f = FETCHERS[m](cfg, args.test_url)
-        f.start()
-        try:
-            (status, payload, err), = f.fetch_batch([args.test_url])
-        finally:
-            f.stop()
-        print("mode:", m, "| status:", status, "| err:", err)
+    def flush(self):
+        self.csv_f.flush()
+        self.done_f.flush()
+        self.since_flush = 0
+
+    async def handle(self, task, sess, tab):
+        pid, url = task["pid"], task["url"]
+        res = await sess.fetch_config(url, PDP_JS, pid, tab=tab, expect=f"/{pid}")
+        payload, note = None, ""
+        if res.kind == "ok":
+            try:
+                payload = json.loads(res.data)
+            except ValueError:
+                payload = None
+            if not payload or not payload.get("ent"):
+                payload, note = None, "no entity"
+                res = Fetch("ok", detail="no entity")        # the page loaded fine: not a block
+        await sess.report(res)
+
         if payload:
-            rows = parse_payload(payload, args.test_url, base)
-            print(f"{len(rows)} rows. First row:")
-            print(json.dumps(rows[0], indent=2, ensure_ascii=False))
-        return
+            try:
+                rows = parse_payload(payload, url, self.base)
+            except Exception as e:
+                log_err(f"[{pid}] parse error: {type(e).__name__}: {e}")
+                rows = None
+            if rows is not None:
+                self.finish_ok(pid, rows)
+                self.progress()
+                return
+            note = "parse error"
+        if res.kind == "gone":
+            self.finish_gone(pid)
+            self.progress()
+            return
 
-    csv_path, done_path = rpath(cfg, "products_csv"), rpath(cfg, "phase2_done_file")
-    run_path, failed_path = rpath(cfg, "phase2_run_file"), rpath(cfg, "phase2_failed_file")
+        task["attempts"] += 1
+        if note == "no entity" and task["attempts"] >= int(self.E["no_entity_attempts"]):
+            self.finish_gone(pid)                            # product page without a product: delisted
+            self.progress()
+        elif task["attempts"] >= int(self.E["max_attempts"]):
+            self.failed.append(pid)
+            self.stats["failed"] += 1
+            log_warn(f"[{pid}] given up after {task['attempts']} attempts ({note or res.kind}: {res.detail})")
+        else:
+            self.stats["retried"] += 1
+            self.queue.put(task)
+
+    def progress(self):
+        if time.time() - self.last_print < 15:
+            return
+        self.last_print = time.time()
+        n_done = self.stats["ok"] + self.stats["gone"] + self.stats["failed"]
+        rate = n_done / max(time.time() - self.t0, 1)
+        eta = (self.total - n_done) / rate / 60 if rate else 0
+        print(f"  {n_done:,}/{self.total:,} | ok {self.stats['ok']:,} gone {self.stats['gone']:,} "
+              f"failed {self.stats['failed']:,} retried {self.stats['retried']:,} | rows {self.stats['rows']:,} | "
+              f"{rate:.2f} pdp/s | ETA {eta:.0f} min", flush=True)
+
+
+async def run_enrich(cfg, args):
+    base = build_base_row(cfg)
+    csv_path, done_path = rpath(cfg, "products_csv"), rpath(cfg, "enrich_done")
+    run_path, failed_path = rpath(cfg, "enrich_run"), rpath(cfg, "enrich_failed")
 
     run = json.loads(run_path.read_text()) if run_path.exists() else {}
-    if args.fresh or (cfg.get("auto_reset_daily", True) and run.get("run_date") not in (None, today())):
+    if args.fresh or (cfg["enrich"].get("auto_reset_daily", True) and run.get("run_date") not in (None, today())):
         log_info("New day / --fresh: starting a clean products.csv")
         for p in (csv_path, done_path, failed_path):
             p.unlink(missing_ok=True)
@@ -578,17 +256,12 @@ def main():
 
     items = load_items(cfg, args.job)
     done = set(done_path.read_text().split()) if done_path.exists() else set()
-    pending = deque((pid, u) for pid, u in items if pid not in done)
+    pending = [(pid, u) for pid, u in items if pid not in done]
     if args.limit:
-        pending = deque(list(pending)[:args.limit])
-    total = len(pending)
-    log_info(f"{len(items):,} products in listing, {len(done):,} already done, {total:,} to fetch")
-    if not total:
+        pending = pending[:args.limit]
+    log_info(f"{len(items):,} products in listing, {len(done):,} already done, {len(pending):,} to fetch")
+    if not pending:
         return
-
-    probe = [u for _, u in list(pending)[:4]]
-    fetcher = choose_fetcher(mode, cfg, pending[0][1], probe)
-    log_info(f"Fetch mode: {fetcher.name}")
 
     write_header = not csv_path.exists()
     csv_f = open(csv_path, "a", newline="", encoding="utf-8")
@@ -596,59 +269,71 @@ def main():
     if write_header:
         writer.writeheader()
     done_f = open(done_path, "a", encoding="utf-8")
-
-    attempts, failed, stats = Counter(), [], Counter()
-    t0, batches = time.time(), 0
+    state = Enrich(cfg, args, base, writer, csv_f, done_f, len(pending))
+    for pid, url in pending:
+        state.queue.put({"pid": pid, "url": url, "attempts": 0})
     try:
-        while pending:
-            batch = [pending.popleft() for _ in range(min(fetcher.batch_size, len(pending)))]
-            results = fetcher.fetch_batch([u for _, u in batch])
-            retry, codes = [], Counter()
-            for (pid, url), (status, payload, err) in zip(batch, results):
-                codes[f"{status}:{err}" if err else str(status)] += 1
-                if status == 200 and payload:
-                    rows = parse_payload(payload, url, base)
-                    writer.writerows(rows)
-                    stats["rows"] += len(rows)
-                    stats["ok"] += 1
-                    done_f.write(pid + "\n")
-                elif status in (404, 410):
-                    stats["gone"] += 1
-                    done_f.write(pid + "\n")
-                else:
-                    attempts[pid] += 1
-                    if attempts[pid] >= cfg["max_attempts"]:
-                        failed.append(pid)
-                        stats["failed"] += 1
-                    else:
-                        retry.append((pid, url))
-                        stats["retried"] += 1
-            csv_f.flush()
-            done_f.flush()
-            batches += 1
-
-            n_done = stats["ok"] + stats["gone"] + stats["failed"]
-            rate = n_done / max(time.time() - t0, 1)
-            eta = (total - n_done) / rate / 60 if rate else 0
-            print(f"  batch {batches}: {n_done:,}/{total:,} | ok {stats['ok']:,} gone {stats['gone']:,} "
-                  f"failed {stats['failed']:,} | rows {stats['rows']:,} | {rate:.1f} pdp/s | ETA {eta:.0f} min"
-                  f" | responses {dict(codes)}", flush=True)
-
-            if retry:
-                pending.extendleft(reversed(retry))
-            if (retry and len(retry) / len(batch) >= 0.2) or batches % cfg["remint_every_batches"] == 0:
-                fetcher.remint()
-            elif retry:
-                time.sleep(random.uniform(2, 5))
-    except KeyboardInterrupt:
-        log_warn("Interrupted - progress saved, re-run to resume")
+        async with Crawler(cfg) as crawler:
+            log_info(f"{crawler.n} browser(s) x {crawler.tabs} tab(s)")
+            await crawler.run(state.queue, state.handle)
     finally:
+        state.flush()
         csv_f.close()
         done_f.close()
-        fetcher.stop()
-        failed_path.write_text("\n".join(failed))
-    log_ok(f"Finished: {stats['ok']:,} products -> {stats['rows']:,} rows in {csv_path.name} "
-           f"({stats['gone']:,} gone, {stats['failed']:,} failed -> {failed_path.name})")
+        failed_path.write_text("\n".join(state.failed))
+    s = state.stats
+    log_ok(f"Finished: {s['ok']:,} products -> {s['rows']:,} rows in {csv_path.name} "
+           f"({s['gone']:,} gone, {s['failed']:,} failed -> {failed_path.name})")
+
+
+async def run_single(cfg, url, dump):
+    pid = product_id_from(url)
+    async with Crawler(cfg, workers=1) as crawler:
+        sess = crawler.sessions[0]
+        if dump:
+            res = await sess.fetch_config(url, "() => JSON.stringify(window.__INITIAL_CONFIG__ || null)",
+                                          expect=f"/{pid}")
+            if res.kind != "ok":
+                log_err(f"No config: {res.kind} {res.detail or res.status}")
+                return
+            cfg_json = json.loads(res.data)
+            out = ROOT / cfg["output_dir"] / f"debug_{pid}.json"
+            out.parent.mkdir(exist_ok=True)
+            out.write_text(json.dumps(cfg_json, indent=1), encoding="utf-8")
+            ents = ((cfg_json.get("productDisplay") or {}).get("productDisplaysById") or {}).get("entities") or {}
+            ent = ents.get(pid) or next(iter(ents.values()), {})
+            log_ok(f"Saved {out}")
+            print("top-level keys:", list(cfg_json))
+            print("entity keys:", list(ent))
+            return
+        res = await sess.fetch_config(url, PDP_JS, pid, expect=f"/{pid}")
+        print("result:", res.kind, res.detail or res.status, f"{res.secs:.1f}s")
+        if res.kind == "ok":
+            payload = json.loads(res.data)
+            rows = parse_payload(payload, url, build_base_row(cfg))
+            print(f"{len(rows)} rows. First row:")
+            print(json.dumps(rows[0], indent=2, ensure_ascii=False))
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config", default=str(ROOT / "config.json"))
+    ap.add_argument("--job", help="only this category (women/men/kids)")
+    ap.add_argument("--fresh", action="store_true")
+    ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--test-url")
+    ap.add_argument("--dump-url")
+    args = ap.parse_args()
+
+    cfg = load_config(args.config)
+    log_head("Phase 2 - PDP enrichment")
+    try:
+        if args.test_url or args.dump_url:
+            asyncio.run(run_single(cfg, args.test_url or args.dump_url, bool(args.dump_url)))
+        else:
+            asyncio.run(run_enrich(cfg, args))
+    except KeyboardInterrupt:
+        log_warn("Interrupted - progress saved, re-run to resume")
 
 if __name__ == "__main__":
     main()
