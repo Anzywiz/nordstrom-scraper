@@ -16,21 +16,20 @@ Speed tricks:
 
 Failure handling: Nordstrom redirects some sessions to siteclosed.nordstrom.com. That is detected
 within ~1s, backed off, retried, and after a few in a row the browser restarts on a new proxy
-with a fresh profile. A block never ends the run.
+on a fresh browser. A block never ends the run.
 """
 import asyncio
 import json
 import os
 import platform
 import random
-import shutil
 import subprocess
 import time
 import traceback
 import uuid
 from collections import deque
 from dataclasses import dataclass
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 from nord_core import ROOT, ProxyPool, log_err, log_info, log_ok, log_warn, proxy_list
 
@@ -111,17 +110,30 @@ class Fetch:
     secs: float = 0.0
 
 
-# ── one browser (own profile + proxy, several tabs) ───────────────────────
+def proxy_label(proxy):
+    """Log label for a proxy: 'username:***' (password redacted) instead of the shared host, so each
+    login of a rotating pool (username-1 ... username-100) can be told apart in the log."""
+    if not proxy:
+        return "direct"
+    user = proxy.get("username")
+    if not user:
+        try:
+            user = urlparse(proxy.get("url") or "").username
+        except Exception:
+            user = None
+    return f"{unquote(user)}:***" if user else (proxy.get("label") or "proxy")
+
+
+# ── one browser (own proxy, several tabs) ─────────────────────────────────
 class CloakSession:
     def __init__(self, cfg, tag, pool):
         self.cfg, self.b, self.r = cfg, cfg["browser"], cfg["retry"]
         self.tag, self.pool = f"[{tag}] ", pool
-        self.profile = ROOT / self.b.get("profile_dir", "output/profiles") / tag
         self.url_markers = list(self.b.get("block_url_markers") or ["siteclosed"])
         self.title_markers = list(self.b.get("block_title_markers") or ["access denied"])
         self._state_js = state_js(self.title_markers)
         self._blocked_types = set(self.b.get("block_resources") or [])
-        self.proxy, self.ctx, self.pages = None, None, []
+        self.proxy, self.browser, self.ctx, self.pages = None, None, None, []
         self.generation = 0
         self.consec, self.clean, self.slow = 0, 0, 1.0
 
@@ -148,40 +160,37 @@ class CloakSession:
             await self._close()
             if limit and n >= limit:
                 raise RuntimeError(f"No accepted session after {n} attempts (browser.session_attempts={limit})")
-            wait = min(10 * 2 ** min(n - 1, 5), self.r["max_backoff_seconds"]) + random.uniform(0, 5)
-            log_warn(f"{self.tag}session attempt {n} rejected; waiting {wait:.0f}s, then next proxy")
+            wait = float(self.b.get("session_retry_wait_seconds", 3)) + random.uniform(0, 2)
+            log_warn(f"{self.tag}session attempt {n} rejected ({proxy_label(self.proxy)}); waiting {wait:.0f}s, then next proxy")
             await asyncio.sleep(wait)
 
     async def _launch(self, proxy):
-        from cloakbrowser import launch_persistent_context_async
-        if self.b.get("fresh_profile_on_start", True) and self.profile.exists():
-            shutil.rmtree(self.profile, ignore_errors=True)
-        self.profile.mkdir(parents=True, exist_ok=True)
+        """Plain (non-persistent) browser + one fresh context. Every launch is a clean session."""
+        from cloakbrowser import launch_async
         kwargs = {"headless": bool(self.b.get("headless", False))}
         kwargs.update(self.b.get("launch_kwargs") or {})
         # proxy: try the URL form first, then the Playwright dict form
         forms = [None]
         if proxy:
             forms = [proxy["url"], {k: proxy[k] for k in ("server", "username", "password") if k in proxy}]
-        ctx, last = None, None
+        browser, last = None, None
         for form in forms:
             kw = dict(kwargs)
             if form is not None:
                 kw["proxy"] = form
             try:
-                ctx = await launch_persistent_context_async(str(self.profile), **kw)
+                browser = await launch_async(**kw)
                 break
             except Exception as e:
                 last = e
-        if ctx is None:
+        if browser is None:
             raise last
-        self.ctx = ctx
+        self.browser = browser
+        self.ctx = await browser.new_context()
         if self._blocked_types:
-            await ctx.route("**/*", self._route)
+            await self.ctx.route("**/*", self._route)
         n_tabs = max(1, int(self.b["tabs_per_browser"]))
-        self.pages = list(ctx.pages[:1]) or [await ctx.new_page()]
-        while len(self.pages) < n_tabs:
-            self.pages.append(await ctx.new_page())
+        self.pages = [await self.ctx.new_page() for _ in range(n_tabs)]
 
     async def _route(self, route):
         if route.request.resource_type in self._blocked_types:
@@ -208,7 +217,7 @@ class CloakSession:
             title = (await page.title()) or ""
         except Exception:
             title = ""
-        label = self.proxy["label"] if self.proxy else "direct"
+        label = proxy_label(self.proxy)
         if not loaded or self._is_block(page.url, title):
             log_warn(f"{self.tag}warm-up rejected (title {title!r}, url {page.url[:60]}, proxy {label})")
             return False
@@ -216,32 +225,33 @@ class CloakSession:
         return True
 
     async def _close(self):
-        try:
-            if self.ctx:
-                await self.ctx.close()
-        except Exception:
-            pass
-        self.ctx, self.pages = None, []
+        for obj in (self.ctx, self.browser):
+            try:
+                if obj:
+                    await obj.close()
+            except Exception:
+                pass
+        self.ctx = self.browser = None
+        self.pages = []
         self.pool.release(self.proxy)
 
     async def stop(self):
         await self._close()
-        if self.b.get("fresh_profile_on_start", True):
-            shutil.rmtree(self.profile, ignore_errors=True)
 
     async def restart(self, seen_generation=None):
-        """New browser, fresh profile, next proxy. Safe to call from several tabs at once."""
+        """New browser, next proxy. Safe to call from several tabs at once."""
         async with self._lock:
             if seen_generation is not None and seen_generation != self.generation:
                 return                                   # another tab already restarted it
             self._ready.clear()
-            log_warn(f"{self.tag}restarting browser...")
+            log_warn(f"{self.tag}restarting browser (leaving {proxy_label(self.proxy)})...")
             self.pool.fail(self.proxy)
             await self._close()
             await asyncio.sleep(random.uniform(3, 6))
             await self._boot_until_healthy()
             self.generation += 1
             self.consec = 0
+            self.slow = 1.0              # a block belongs to the old session/IP
             self._ready.set()
 
     # fetching -------------------------------------------------------------
@@ -335,8 +345,9 @@ class CloakSession:
 
     # pacing / block handling ---------------------------------------------
     async def report(self, res: Fetch):
-        """Call after EVERY fetch. Success -> polite delay. Block/error -> growing wait, and after
-        retry.restart_after_failures in a row -> fresh browser on the next proxy."""
+        """Call after EVERY fetch. Success -> polite delay. Block -> after retry.restart_after_blocks
+        in a row (default 2) the browser is closed and reopened on the next proxy IMMEDIATELY (no long
+        backoff first). Other errors use retry.restart_after_failures (default 5)."""
         if res.kind in ("ok", "gone"):
             self.consec, self.clean = 0, self.clean + 1
             self.pool.ok(self.proxy)
@@ -345,17 +356,25 @@ class CloakSession:
             d = float(self.cfg["retry"]["delay_seconds"])
             await asyncio.sleep(random.uniform(d * 0.8, d * 1.3) * self.slow)
             return
+        if res.detail == "browser restarted during fetch":
+            return                                   # another tab restarted it: not a new failure
         self.consec += 1
         self.clean = 0
-        if res.kind == "blocked":
+        is_block = res.kind == "blocked"
+        if is_block:
             self.slow = min(self.slow * 1.6, 6.0)
-        wait = min(float(self.r["base_backoff_seconds"]) * 2 ** (self.consec - 1),
-                   float(self.r["max_backoff_seconds"])) + random.uniform(0, 3)
-        log_warn(f"{self.tag}{res.kind} ({res.detail or res.status}) x{self.consec} in a row -> waiting {wait:.0f}s")
+        limit = int(self.r.get("restart_after_blocks", 2)) if is_block \
+            else int(self.r.get("restart_after_failures", 5))
         gen = self.generation
-        await asyncio.sleep(wait)
-        if self.consec >= int(self.r["restart_after_failures"]):
+        if self.consec >= limit:
+            log_warn(f"{self.tag}{res.kind} ({res.detail or res.status}) x{self.consec} "
+                     f"[{proxy_label(self.proxy)}] -> closing browser, reopening on next proxy")
             await self.restart(gen)
+            return
+        wait = float(self.r.get("block_pause_seconds", 2)) + random.uniform(0, 2)
+        log_warn(f"{self.tag}{res.kind} ({res.detail or res.status}) x{self.consec} "
+                 f"[{proxy_label(self.proxy)}] -> pausing {wait:.0f}s")
+        await asyncio.sleep(wait)
 
 
 SESSION_CLASS = CloakSession          # tests swap in a fake
