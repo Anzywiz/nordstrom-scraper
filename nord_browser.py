@@ -23,6 +23,7 @@ import json
 import os
 import platform
 import random
+import re
 import subprocess
 import time
 import traceback
@@ -31,7 +32,7 @@ from collections import deque
 from dataclasses import dataclass
 from urllib.parse import unquote, urlparse
 
-from nord_core import ROOT, ProxyPool, log_err, log_info, log_ok, log_warn, proxy_list
+from nord_core import log_err, log_info, log_ok, log_warn, proxy_list
 
 
 # ── JS run inside the page ────────────────────────────────────────────────
@@ -122,6 +123,72 @@ def proxy_label(proxy):
         except Exception:
             user = None
     return f"{unquote(user)}:***" if user else (proxy.get("label") or "proxy")
+
+
+def load_proxies():
+    """Proxy dicts built from nord_core.proxy_list(). Any entry that still holds several proxies
+    (comma / semicolon / whitespace / newline separated) is split, duplicates are dropped."""
+    urls, seen = [], set()
+    for p in proxy_list() or []:
+        raw = p.get("url") if isinstance(p, dict) else str(p)
+        for part in re.split(r"[,;\s]+", (raw or "").strip()):
+            if part and part not in seen:
+                seen.add(part)
+                urls.append(part)
+    out = []
+    for u in urls:
+        full = u if "://" in u else f"http://{u}"
+        pr = urlparse(full)
+        if not pr.hostname:
+            continue
+        d = {"url": full,
+             "server": f"{pr.scheme}://{pr.hostname}" + (f":{pr.port}" if pr.port else ""),
+             "label": f"{pr.hostname}:{pr.port or ''}"}
+        if pr.username:
+            d["username"] = unquote(pr.username)
+        if pr.password:
+            d["password"] = unquote(pr.password)
+        out.append(d)
+    return out
+
+
+class RotatingPool:
+    """Round-robin proxy pool. acquire() always moves on to the NEXT proxy that is not cooling down and
+    not held by another browser; fail() puts a proxy in cooldown (browser.proxy_cooldown_seconds).
+    If every proxy is cooling down, the one that cools down soonest is used (never blocks)."""
+
+    def __init__(self, proxies, cooldown=120.0):
+        self.items, self.cooldown, self.ptr = list(proxies), float(cooldown), 0
+        self.cool_until, self.in_use = {}, {}
+
+    def __len__(self):
+        return len(self.items)
+
+    def acquire(self, tag=None):
+        if not self.items:
+            return None
+        now, n = time.time(), len(self.items)
+        order = [self.items[(self.ptr + k) % n] for k in range(n)]
+        ready = [p for p in order if self.cool_until.get(p["url"], 0) <= now and not self.in_use.get(p["url"])]
+        if ready:
+            pick = ready[0]
+        else:
+            free = [p for p in order if not self.in_use.get(p["url"])] or order
+            pick = min(free, key=lambda p: self.cool_until.get(p["url"], 0))
+        self.ptr = (self.items.index(pick) + 1) % n
+        self.in_use[pick["url"]] = self.in_use.get(pick["url"], 0) + 1
+        return pick
+
+    def release(self, proxy):
+        if proxy and self.in_use.get(proxy["url"]):
+            self.in_use[proxy["url"]] -= 1
+
+    def fail(self, proxy):
+        if proxy:
+            self.cool_until[proxy["url"]] = time.time() + self.cooldown
+
+    def ok(self, proxy):
+        pass
 
 
 # ── one browser (own proxy, several tabs) ─────────────────────────────────
@@ -436,7 +503,7 @@ class Crawler:
         b = cfg["browser"]
         self.n = max(1, int(workers or b["workers"]))
         self.tabs = max(1, int(b["tabs_per_browser"]))
-        self.pool = ProxyPool(proxy_list(), cooldown=float(b.get("proxy_cooldown_seconds", 120)))
+        self.pool = RotatingPool(load_proxies(), cooldown=float(b.get("proxy_cooldown_seconds", 120)))
         self.sessions, self._xvfb = [], None
 
     async def __aenter__(self):
@@ -445,6 +512,11 @@ class Crawler:
             log_warn(f"Only {len(self.pool)} proxies for {self.n} browsers - some browsers will share a proxy")
         if not len(self.pool):
             log_info("No PROXY_LIST set: connecting directly")
+        else:
+            log_info(f"{len(self.pool)} proxies loaded, rotating in order: "
+                     f"{proxy_label(self.pool.items[0])} ... {proxy_label(self.pool.items[-1])}")
+            if len(self.pool) == 1:
+                log_warn("PROXY_LIST holds only ONE proxy - nothing to rotate to. Separate entries with commas.")
         self.sessions = [make_session(self.cfg, f"b{i + 1}", self.pool) for i in range(self.n)]
         stagger = float(self.cfg["browser"].get("start_stagger_seconds", 8))
 
