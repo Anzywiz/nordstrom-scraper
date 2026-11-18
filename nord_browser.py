@@ -26,6 +26,7 @@ import random
 import subprocess
 import time
 import traceback
+import re
 import uuid
 from collections import deque
 from dataclasses import dataclass
@@ -93,12 +94,60 @@ async (a) => {
 }
 """
 
+# PDP details API (enrich.source = "api"): XMLHttpRequest from inside a nordstrom.com page, so the page's own
+# bot-manager script decorates the request. Returns {s: status, t: body}.
+QV_RE = re.compile(r"^\s*quick\s*view\s*$", re.I)
+HEART_SEL = 'button[aria-label="Add to Wishlist"]'      # the wishlist heart on every listing tile
+HEART_TILE_SEL = 'article:has(a[href^="/s/"]), li:has(a[href^="/s/"])'
+_SKIP_HDR = {"host", "user-agent", "referer", "origin", "cookie", "connection", "content-length", "accept-encoding",
+             "accept-language", "priority", "dnt", "upgrade-insecure-requests"}
+_SENSOR_RE = re.compile(r"^x-[a-z0-9]{6,}-[a-z0-9]{1,2}$", re.I)      # bot-manager headers: the page adds them itself
+
+PDP_API_JS = r"""
+(a) => new Promise((resolve) => {
+  const x = new XMLHttpRequest();
+  x.open('GET', a.url);
+  for (const [k, v] of Object.entries(a.headers)) { try { x.setRequestHeader(k, v); } catch (e) {} }
+  x.timeout = a.timeout;
+  x.onload = () => resolve({s: x.status, t: x.responseText});
+  x.onerror = () => resolve({s: 0, t: 'xhr error'});
+  x.ontimeout = () => resolve({s: 0, t: 'xhr timeout'});
+  x.send();
+})
+"""
+
 def state_js(title_markers):
     """'D' = block page title, 'R' = config present, '' = keep waiting."""
     markers = json.dumps([m.lower() for m in title_markers])
     return ("(() => { const t = (document.title || '').toLowerCase(); "
             f"if ({markers}.some(m => t.includes(m))) return 'D'; "
             "return typeof window.__INITIAL_CONFIG__ !== 'undefined' ? 'R' : ''; })()")
+
+
+
+# listing API through XMLHttpRequest from inside the page: the bot-manager script adds its x-...-a/b/c/d/f/z headers
+# to XHRs it sees (plain fetch() got 403). Same output shape as API_FETCH_JS.
+LISTING_XHR_JS = r"""
+(a) => new Promise((resolve) => {
+  const isFacet = v => v && typeof v === 'object' && !Array.isArray(v) &&
+      Array.isArray(v.values) && typeof v.name === 'string' && ('productDisplayCount' in v);
+  const strip = (k, v) => (k === 'fulfillmentChannels' || k === 'services' || k === 'nodes' ||
+      (!a.keepFacets && isFacet(v))) ? undefined : v;
+  const x = new XMLHttpRequest();
+  x.open('GET', a.url);
+  for (const [k, v] of Object.entries(a.headers)) { try { x.setRequestHeader(k, v); } catch (e) {} }
+  x.timeout = a.timeout || 40000;
+  x.onload = () => {
+    if (x.status !== 200) { resolve({s: x.status, t: (x.responseText || '').slice(0, 300)}); return; }
+    try { resolve({s: 200, t: JSON.stringify(JSON.parse(x.responseText), strip)}); }
+    catch (e) { resolve({s: 200, t: (x.responseText || '').slice(0, 300), bad: true}); }
+  };
+  x.onerror = () => resolve({s: 0, t: 'xhr error'});
+  x.ontimeout = () => resolve({s: 0, t: 'xhr timeout'});
+  x.send();
+})
+"""
+LISTING_API_MARK = "/sbn/v2/category/query/browse/"
 
 
 @dataclass
@@ -133,6 +182,7 @@ class CloakSession:
         self.title_markers = list(self.b.get("block_title_markers") or ["access denied"])
         self._state_js = state_js(self.title_markers)
         self._blocked_types = set(self.b.get("block_resources") or [])
+        self._blocked_urls = [x.lower() for x in (self.b.get("block_url_patterns") or []) if x]
         self.proxy, self.browser, self.ctx, self.pages = None, None, None, []
         self.generation = 0
         self.consec, self.clean, self.slow = 0, 0, 1.0
@@ -187,14 +237,16 @@ class CloakSession:
             raise last
         self.browser = browser
         self.ctx = await browser.new_context()
-        if self._blocked_types:
+        if self._blocked_types or self._blocked_urls:
             await self.ctx.route("**/*", self._route)
         n_tabs = max(1, int(self.b["tabs_per_browser"]))
         self.pages = [await self.ctx.new_page() for _ in range(n_tabs)]
 
     async def _route(self, route):
-        if route.request.resource_type in self._blocked_types:
-            await route.abort()
+        req = route.request
+        if req.resource_type in self._blocked_types or (
+                self._blocked_urls and any(p in req.url.lower() for p in self._blocked_urls)):
+            await route.abort()                               # images / media / fonts / trackers: pure proxy bandwidth
         else:
             await route.continue_()
 
@@ -247,13 +299,13 @@ class CloakSession:
         async with self._lock:
             if seen_generation is not None and seen_generation != self.generation:
                 return                                   # another tab already restarted it
+            self.generation += 1                         # in-flight fetches on the old browser notice at once
             self._ready.clear()
             log_warn(f"{self.tag}restarting browser (leaving {proxy_label(self.proxy)})...")
             self.pool.fail(self.proxy)
             await self._close()
             await asyncio.sleep(random.uniform(3, 6))
             await self._boot_until_healthy()
-            self.generation += 1
             self.consec = 0
             self.slow = 1.0              # a block belongs to the old session/IP
             self._ready.set()
@@ -322,9 +374,199 @@ class CloakSession:
         h["experimentid"] = exp or str(uuid.uuid4())
         return {k: v for k, v in h.items() if v}
 
+    # listing API (listing.source = "api"): Next-click mint + in-page XHR --------------
+    def listing_api_cfg(self) -> dict:
+        return self.cfg["listing"].get("api") or {}
+
+    async def _find_page_next(self, page):
+        """The pagination Next control (not the colour-swatch carousel arrows inside product tiles)."""
+        cands = (page.get_by_role("link", name=re.compile(r"^\s*next", re.I)),
+                 page.get_by_role("button", name=re.compile(r"^\s*next", re.I)),
+                 page.locator('[aria-label*="next" i]'),
+                 page.locator('a:has-text("Next"), button:has-text("Next")'))
+        for loc in cands:
+            try:
+                n = await loc.count()
+            except Exception:
+                continue
+            for i in range(n):
+                el = loc.nth(i)
+                try:
+                    if not await el.is_visible():
+                        continue
+                    if await el.evaluate("e => !!e.closest('article')"):
+                        continue
+                    return el
+                except Exception:
+                    continue
+        return None
+
+    async def _mint_listing(self, page) -> str:
+        """Open the mint listing page, scroll down, click the pagination Next: the page then fires its own
+        /sbn/v2/category/query/browse/... call. Its request headers (this listing's nord-api-key, context id, ...)
+        are kept for our XHRs. Returns '' on success, else a reason."""
+        A, site = self.listing_api_cfg(), self.cfg["site"]
+        u = (A.get("mint_url") or "/browse/women?breadcrumb=Home%2FWomen&origin=topnav").strip()
+        url = site["url"] + u if u.startswith("/") else u
+        seen = []
+
+        def on_req(r):
+            if r.resource_type in ("xhr", "fetch") and LISTING_API_MARK in r.url:
+                seen.append(r)
+
+        page.on("request", on_req)
+        try:
+            try:
+                await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+            except Exception as e:
+                return f"navigation: {str(e)[:60]}"
+            tiles, t_end, found = page.locator(HEART_TILE_SEL), time.time() + float(A.get("mint_timeout_seconds", 40)), False
+            while time.time() < t_end:
+                try:
+                    title = (await page.title()) or ""
+                except Exception:
+                    title = ""
+                if self._is_block(page.url, title):
+                    return f"block page ({title!r})"
+                if await tiles.count() >= 3:
+                    found = True
+                    break
+                await asyncio.sleep(0.5)
+            if not found:
+                return "no product tiles"
+            nxt = None
+            for _ in range(25):
+                await page.mouse.wheel(0, 2500)
+                await asyncio.sleep(0.7)
+                await page.keyboard.press("End")
+                nxt = await self._find_page_next(page)
+                if nxt:
+                    break
+            if not nxt:
+                return "pagination Next button not found"
+            try:
+                await nxt.scroll_into_view_if_needed(timeout=5000)
+                await asyncio.sleep(0.5)
+                seen.clear()
+                await nxt.click(timeout=8000)
+            except Exception as e:
+                return f"Next click failed: {str(e)[:60]}"
+            for _ in range(40):
+                if seen:
+                    break
+                await asyncio.sleep(0.5)
+            if not seen:
+                return "the Next click did not fire the listing API"
+            try:
+                raw = {k.lower(): v for k, v in (await seen[-1].all_headers()).items()}
+            except Exception:
+                raw = {k.lower(): v for k, v in seen[-1].headers.items()}
+            hdrs = {k: v for k, v in raw.items() if k not in _SKIP_HDR and not k.startswith(("sec-", ":"))
+                    and not _SENSOR_RE.match(k)}
+            try:
+                resp = await asyncio.wait_for(seen[-1].response(), 20)
+                status = resp.status if resp else 0
+            except Exception:
+                status = 0
+            if status != 200:
+                return f"the page's own listing call got HTTP {status}"
+            if not hdrs.get("nord-api-key"):
+                return "the page's listing call carried no nord-api-key"
+            first = not self.__dict__.get("_lst_hdrs")
+            self._lst_hdrs = hdrs
+            if first:
+                k = hdrs["nord-api-key"]
+                log_info(f"{self.tag}listing API headers captured from the page ({len(hdrs)}), nord-api-key {k[:4]}...{k[-3:]}")
+            return ""
+        finally:
+            try:
+                page.remove_listener("request", on_req)
+            except Exception:
+                pass
+
+    async def _lst_prepare(self, tab, why="") -> str:
+        """Make sure this browser has a minted listing session within its request budget.
+        Order: budget used -> reload+Next (same browser/IP) up to max_reloads, then a fresh browser on the next proxy."""
+        A, gen = self.listing_api_cfg(), self.generation
+        st = self.__dict__.setdefault("_lst", {"gen": gen, "n": 0, "ready": False, "reloads": 0})
+        if st["gen"] != gen:
+            st.update(gen=gen, n=0, ready=False, reloads=0)
+            self._lst_hdrs = None
+        ra, mr = int(A.get("reload_after_requests", 22) or 0), int(A.get("max_reloads_per_session", 6) or 0)
+        lock = self.__dict__.setdefault("_mint_lock", asyncio.Lock())
+        need = (not st["ready"]) or (ra and st["n"] >= ra) or bool(why)
+        if not need:
+            return ""
+        if st["ready"] and mr and st["reloads"] >= mr:
+            log_info(f"{self.tag}listing session budget used ({st['n']} requests, {st['reloads']} reloads on "
+                     f"{proxy_label(self.proxy)}) -> fresh browser on the next proxy")
+            await self.restart(gen)
+            await self._ready.wait()
+            gen = self.generation
+            st.update(gen=gen, n=0, ready=False, reloads=0)
+            self._lst_hdrs = None
+        page = self.pages[tab % len(self.pages)]
+        async with lock:
+            t0 = time.time()
+            reason = await self._mint_listing(page)
+        if reason:
+            st["ready"] = False
+            return reason
+        if st["ready"]:
+            st["reloads"] += 1
+            log_info(f"{self.tag}listing reload+Next ok ({why or str(st['n']) + ' requests'}, {time.time() - t0:.1f}s, "
+                     f"reload #{st['reloads']} on {proxy_label(self.proxy)})")
+        st["ready"], st["n"] = True, 1
+        return ""
+
+    async def _fetch_api_next(self, url, tab=0, keep_facets=False) -> Fetch:
+        t0 = time.time()
+        A = self.listing_api_cfg()
+        reason = await self._lst_prepare(tab)
+        if reason:
+            log_warn(f"{self.tag}listing mint failed ({reason}) on {proxy_label(self.proxy)}")
+            return Fetch("blocked", detail=f"mint: {reason}", secs=time.time() - t0)
+        st = self._lst
+        page = self.pages[tab % len(self.pages)]
+        arg = {"url": url, "keepFacets": keep_facets, "timeout": 40000}
+        out = None
+        for attempt in (1, 2):
+            hdrs = dict(self.__dict__.get("_lst_hdrs") or await self.api_headers(tab))
+            hdrs["nord-request-id"] = str(uuid.uuid4())
+            arg["headers"] = hdrs
+            try:
+                out = await asyncio.wait_for(page.evaluate(LISTING_XHR_JS, arg),
+                                             timeout=float(self.b["config_timeout_seconds"]) + 30)
+            except Exception as e:
+                return Fetch("error", detail=f"{type(e).__name__}: {str(e)[:80]}", secs=time.time() - t0)
+            st["n"] += 1
+            if out.get("s") in (403, 429) and attempt == 1 and A.get("reload_on_block", True) \
+                    and not (int(A.get("max_reloads_per_session", 6) or 0) and st["reloads"] >= int(A.get("max_reloads_per_session", 6))):
+                reason = await self._lst_prepare(tab, why=f"HTTP {out.get('s')}")
+                if reason:
+                    log_warn(f"{self.tag}listing reload+Next failed ({reason})")
+                    return Fetch("blocked", detail=f"HTTP {out.get('s')} + mint: {reason}", status=out.get("s"),
+                                 secs=time.time() - t0)
+                continue
+            break
+        s = out.get("s", 0)
+        if s == 200 and not out.get("bad"):
+            return Fetch("ok", data=out["t"], status=200, secs=time.time() - t0)
+        if s == 401:
+            log_warn(f"{self.tag}listing API HTTP 401: nord headers rejected - not a used-up session, browser kept")
+            return Fetch("error", detail="HTTP 401 nord headers rejected", status=s, secs=time.time() - t0)
+        if s in (403, 429):
+            return Fetch("blocked", detail=f"HTTP {s}", status=s, secs=time.time() - t0)
+        if s == 404:
+            return Fetch("gone", status=s, secs=time.time() - t0)
+        return Fetch("error", detail=f"HTTP {s} {str(out.get('t'))[:60]!r}", status=s, secs=time.time() - t0)
+
     async def fetch_api(self, url, tab=0, keep_facets=False) -> Fetch:
-        """fetch() the sbn/v2 browse API from inside a nordstrom.com page (same origin, real cookies)."""
+        """sbn/v2 browse API from inside a nordstrom.com page (same origin, real cookies).
+        listing.api.mint_mode "next" (default): Next-click mint + XHR with the page's headers; "plain": old fetch()."""
         await self._ready.wait()
+        if (self.listing_api_cfg().get("mint_mode") or "next") == "next":
+            return await self._fetch_api_next(url, tab, keep_facets)
         t0 = time.time()
         page = self.pages[tab % len(self.pages)]
         site = self.cfg["site"]
@@ -347,8 +589,359 @@ class CloakSession:
             return Fetch("gone", status=s, secs=time.time() - t0)
         return Fetch("error", detail=f"HTTP {s} {str(out.get('t'))[:60]!r}", status=s, secs=time.time() - t0)
 
+    # PDP details API ------------------------------------------------------
+    def api_cfg(self) -> dict:
+        return self.cfg["enrich"].get("api") or {}
+
+    def pdp_api_headers(self) -> dict:
+        A = self.api_cfg()
+        h = {"accept": "*/*", "content-type": "application/json",
+             "nord-channel-brand": "NORDSTROM", "nord-client-id": "APP01196",
+             "nord-country-code": "US", "nord-customer-experience": "DESKTOP_WEB"}
+        h.update({k: v for k, v in (A.get("headers") or {}).items() if v})   # an unset ${ENV} must not blank a default
+        if A.get("use_page_headers", True) and self.__dict__.get("_page_hdrs"):
+            h.update(self._page_hdrs)                         # headers of the page's own call win over config
+        h["nord-request-id"] = str(uuid.uuid4())
+        return {k: v for k, v in h.items() if v}
+
+    def reopen_target(self) -> str:
+        """enrich.api.reopen_url: absolute URL, a /path on the site, or '' for the warm-up (home) page."""
+        site, u = self.cfg["site"], (self.api_cfg().get("reopen_url") or "").strip()
+        if not u:
+            return site["url"] + site.get("warmup_path", "/")
+        return site["url"] + u if u.startswith("/") else u
+
+    async def reopen_page(self, tab=0) -> bool:
+        """Reload the reopen URL in this tab (fresh page state for the site's scripts). False if it landed on a block page."""
+        page = self.pages[tab % len(self.pages)]
+        A = self.api_cfg()
+        await page.goto(self.reopen_target(), wait_until="domcontentloaded", timeout=45000)
+        await asyncio.sleep(float(A.get("reopen_wait_seconds", 2)))
+        try:
+            title = (await page.title()) or ""
+        except Exception:
+            title = ""
+        return not self._is_block(page.url, title)
+
+    async def _pdp_xhr(self, page, url) -> dict:
+        A = self.api_cfg()
+        t = float(A.get("timeout_seconds", 25))
+        arg = {"url": url, "headers": self.pdp_api_headers(), "timeout": int(t * 1000)}
+        return await asyncio.wait_for(page.evaluate(PDP_API_JS, arg), timeout=t + 10)
+
+    async def _close_quickview(self, page):
+        """Close the Quick View modal: Escape, then its close button, then a click on the backdrop corner."""
+        try:
+            await page.keyboard.press("Escape")
+            await asyncio.sleep(0.4)
+            dlg = page.locator('[role="dialog"]')
+            if await dlg.count() and await dlg.first.is_visible():
+                close = page.locator('[role="dialog"] button[aria-label*="close" i], [role="dialog"] button:has-text("Close")')
+                if await close.count():
+                    await close.first.click(timeout=2000)
+                else:
+                    await page.mouse.click(8, 8)
+                await asyncio.sleep(0.4)
+        except Exception:
+            pass
+
+    async def _mint_session(self, page) -> str:
+        """Start of every browser session: open the sale listing, hover a tile and click 'Quick View' so the page
+        itself makes a /pdp/product-display/ call. Only after a real interaction like that did the site's
+        bot-manager script attach its headers to our own in-page requests. Returns '' on success, else a reason."""
+        A, site = self.api_cfg(), self.cfg["site"]
+        u = (A.get("mint_url") or "/browse/sale").strip()
+        url = site["url"] + u if u.startswith("/") else u
+        seen = []
+
+        def on_req(r):
+            if r.resource_type in ("xhr", "fetch") and "/pdp/product-display/" in r.url:
+                seen.append(r)
+
+        page.on("request", on_req)
+        try:
+            try:
+                await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+            except Exception as e:
+                return f"navigation: {str(e)[:60]}"
+            tiles = page.locator('li:has(a[href^="/s/"])')
+            t_end, found = time.time() + float(A.get("mint_timeout_seconds", 40)), False
+            while time.time() < t_end:
+                try:
+                    title = (await page.title()) or ""
+                except Exception:
+                    title = ""
+                if self._is_block(page.url, title):
+                    return f"block page ({title!r})"
+                if await tiles.count() >= 3:
+                    found = True
+                    break
+                await asyncio.sleep(0.5)
+            if not found:
+                return "no product tiles"
+            await page.mouse.wheel(0, 700)
+            await asyncio.sleep(1.2)
+            n = await tiles.count()
+            for i in range(min(int(A.get("mint_tiles", 6)), n)):
+                tile = tiles.nth(i)
+                try:
+                    await tile.scroll_into_view_if_needed(timeout=5000)
+                    box = await tile.locator("img").first.bounding_box()
+                    if box:                                   # real mouse move so :hover / mouseenter fire
+                        await page.mouse.move(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2, steps=8)
+                    else:
+                        await tile.hover(timeout=5000)
+                    await asyncio.sleep(0.5)
+                    btn = tile.get_by_role("button", name=QV_RE)
+                    if await btn.count() == 0:
+                        btn = tile.get_by_text(QV_RE)
+                    if await btn.count() == 0:
+                        continue
+                    seen.clear()
+                    await btn.first.click(timeout=5000)
+                    for _ in range(24):                       # ~12 s for the page's own call
+                        if seen:
+                            try:
+                                resp = await asyncio.wait_for(seen[0].response(), 10)
+                                status = resp.status if resp else 0
+                            except Exception:
+                                status = 0
+                            await asyncio.sleep(0.5)
+                            await self._close_quickview(page)
+                            return "" if status == 200 else f"the page's own Quick View call got HTTP {status}"
+                        await asyncio.sleep(0.5)
+                    await self._close_quickview(page)
+                except Exception:
+                    await self._close_quickview(page)
+            return "Quick View did not fire the PDP call"
+        finally:
+            try:
+                page.remove_listener("request", on_req)
+            except Exception:
+                pass
+
+    async def _mint_heart(self, page, reload=False) -> str:
+        """Open (or reload) a listing page and click the wishlist heart on a tile. The page then makes its own
+        /pdp/product-display/ call, which is what switches on the bot-manager script for our later in-page XHRs.
+        Measured by hand: after ~22 requests the session starts answering 403; reloading the page and clicking a
+        heart again restores it (first call slow, then normal). Returns '' on success, else a reason."""
+        A, site = self.api_cfg(), self.cfg["site"]
+        u = (A.get("heart_url") or "/browse/women/clothing/petite-size"
+             "?breadcrumb=Home%2FWomen%2FPetite-Size%20Clothing&origin=topnav").strip()
+        url = site["url"] + u if u.startswith("/") else u
+        seen = []
+
+        def on_req(r):
+            if r.resource_type in ("xhr", "fetch") and "/pdp/product-display/" in r.url:
+                seen.append(r)
+
+        page.on("request", on_req)
+        try:
+            try:
+                same = urlparse(page.url).path == urlparse(url).path
+                if reload and same:
+                    await page.reload(wait_until="domcontentloaded", timeout=45000)
+                else:
+                    await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+            except Exception as e:
+                return f"navigation: {str(e)[:60]}"
+            hearts, tiles = page.locator(HEART_SEL), page.locator(HEART_TILE_SEL)
+            t_end, found = time.time() + float(A.get("mint_timeout_seconds", 40)), False
+            while time.time() < t_end:
+                try:
+                    title = (await page.title()) or ""
+                except Exception:
+                    title = ""
+                if self._is_block(page.url, title):
+                    return f"block page ({title!r})"
+                if await hearts.count() >= 3 or await tiles.count() >= 3:
+                    found = True
+                    break
+                await asyncio.sleep(0.5)
+            if not found:
+                return "no product tiles / heart buttons"
+            await asyncio.sleep(float(A.get("heart_settle_seconds", 1.5)))
+            for attempt in range(int(A.get("heart_tries", 3))):
+                hearts = page.locator(HEART_SEL)           # a clicked heart no longer says "Add to Wishlist"
+                n = await hearts.count()
+                if n == 0:
+                    break
+                el = hearts.nth(min(attempt, n - 1))
+                try:
+                    await el.scroll_into_view_if_needed(timeout=5000)
+                    await asyncio.sleep(0.4)
+                    seen.clear()
+                    await el.click(timeout=8000)
+                except Exception:
+                    await self._close_quickview(page)
+                    continue
+                for _ in range(40):                        # ~20 s: the first call after a reload is slow
+                    if seen:
+                        await self._remember_page_headers(seen[0])
+                        try:
+                            resp = await asyncio.wait_for(seen[0].response(), 15)
+                            status = resp.status if resp else 0
+                        except Exception:
+                            status = 0
+                        await asyncio.sleep(0.5)
+                        await self._close_quickview(page)
+                        return "" if status == 200 else f"the page's own heart call got HTTP {status}"
+                    await asyncio.sleep(0.5)
+                await self._close_quickview(page)
+            return "the heart click did not fire the PDP call"
+        finally:
+            try:
+                page.remove_listener("request", on_req)
+            except Exception:
+                pass
+
+    async def _remember_page_headers(self, req):
+        """Keep the request headers of the page's OWN PDP call (nord-api-key, nord-context-id, ...). Our in-page
+        XHRs reuse them, so the PDP key no longer has to be right in .env (a wrong/listing key gives HTTP 401)."""
+        try:
+            raw = {k.lower(): v for k, v in (await req.all_headers()).items()}
+        except Exception:
+            raw = {k.lower(): v for k, v in req.headers.items()}
+        hdrs = {k: v for k, v in raw.items() if k not in _SKIP_HDR and not k.startswith(("sec-", ":"))
+                and not _SENSOR_RE.match(k)}
+        if not hdrs.get("nord-api-key"):
+            return
+        old = self.__dict__.get("_page_hdrs") or {}
+        self._page_hdrs = hdrs
+        cfgkey = (self.api_cfg().get("headers") or {}).get("nord-api-key") or ""
+        k = hdrs["nord-api-key"]
+        if not old and cfgkey and cfgkey != k:
+            log_warn(f"{self.tag}the page's PDP nord-api-key ({k[:4]}...{k[-3:]}) differs from NORD_API_KEY_PDP in .env "
+                     f"({cfgkey[:4]}...{cfgkey[-3:]}); using the page's key")
+        elif not old:
+            log_info(f"{self.tag}using the page's own request headers ({len(hdrs)}), nord-api-key {k[:4]}...{k[-3:]}")
+
+    async def _cycle(self, tab, bs, why) -> bool:
+        """Reload the listing page and click a heart again (fresh request budget on the SAME browser and IP).
+        Resets the request counter; False if it failed (caller then restarts the browser on the next proxy)."""
+        page = self.pages[tab % len(self.pages)]
+        lock = self.__dict__.setdefault("_mint_lock", asyncio.Lock())
+        async with lock:
+            t0 = time.time()
+            reason = await self._mint_heart(page, reload=True)
+        if reason:
+            log_warn(f"{self.tag}reload+heart failed ({reason}) on {proxy_label(self.proxy)}")
+            return False
+        bs["n"] = 1                                           # the page's own call counts
+        bs["reloads"] = bs.get("reloads", 0) + 1
+        log_info(f"{self.tag}reload+heart ok ({why}, {time.time() - t0:.1f}s, reload #{bs['reloads']} "
+                 f"on {proxy_label(self.proxy)})")
+        return True
+
+    async def _interact(self, page, secs):
+        """A few mouse moves and scrolls so the site's bot-manager script has real input events to score."""
+        try:
+            vp = page.viewport_size or {"width": 1280, "height": 720}
+            w, h = int(vp["width"]), int(vp["height"])
+            x, y, t_end = random.randint(w // 4, 3 * w // 4), random.randint(h // 4, 3 * h // 4), time.time() + secs
+            while time.time() < t_end:
+                x = max(5, min(w - 5, x + random.randint(-220, 220)))
+                y = max(5, min(h - 5, y + random.randint(-160, 160)))
+                await page.mouse.move(x, y, steps=random.randint(6, 14))
+                if random.random() < 0.4:
+                    await page.mouse.wheel(0, random.randint(150, 500))
+                await asyncio.sleep(random.uniform(0.15, 0.45))
+        except Exception:
+            pass
+
+    async def fetch_pdp_api(self, pid, tab=0) -> Fetch:
+        """GET /pdp/product-display/<pid> from inside the page.
+        Measured: a browser session (IP + cookies) is cut off after about 28 requests of any kind, and neither a
+        reload nor a click on another tile gives it a fresh budget. So after enrich.api.requests_per_session
+        requests the browser is closed BEFORE the block and reopened on the next proxy (a clean exit keeps the
+        IP's reputation; a burst of 403s does not). A 401/403/429 is not retried on the same session."""
+        await self._ready.wait()
+        gen, t0 = self.generation, time.time()
+        A = self.api_cfg()
+        budget = int(A.get("requests_per_session", 0) or 0)
+        bs = self.__dict__.setdefault("_api_budget", {"gen": gen, "n": 0, "warm": False})
+        if bs["gen"] != gen:
+            bs.update(gen=gen, n=0, warm=False, reloads=0)
+        heart_mode = (A.get("mint_mode") or "quickview") == "heart"
+        reload_after = int(A.get("reload_after_requests", 0) or 0) if heart_mode else 0
+        max_reloads = int(A.get("max_reloads_per_session", 0) or 0)
+        reload_ok = bool(reload_after) and not (max_reloads and bs.get("reloads", 0) >= max_reloads)
+        if reload_after and reload_ok and bs["warm"] and bs["n"] >= reload_after:
+            if not await self._cycle(tab, bs, f"{bs['n']} requests"):
+                await self.restart(gen)
+                await self._ready.wait()
+                gen = self.generation
+                bs.update(gen=gen, n=0, warm=False, reloads=0)
+        elif (budget and bs["n"] >= budget) or (reload_after and not reload_ok and bs["n"] >= reload_after):
+            log_info(f"{self.tag}session budget used ({bs['n']} requests, {bs.get('reloads', 0)} reloads on "
+                     f"{proxy_label(self.proxy)}) -> fresh browser on the next proxy")
+            await self.restart(gen)
+            await self._ready.wait()
+            gen = self.generation
+            bs.update(gen=gen, n=0, warm=False, reloads=0)
+        if not bs["warm"]:
+            bs["warm"] = True
+            wpage = self.pages[tab % len(self.pages)] if self.pages else None
+            if wpage and A.get("mint_click", True):
+                why = await (self._mint_heart(wpage) if heart_mode else self._mint_session(wpage))
+                if why:
+                    log_warn(f"{self.tag}session mint failed ({why}) on {proxy_label(self.proxy)}")
+                    return Fetch("blocked", detail=f"mint failed: {why}", secs=time.time() - t0)
+                bs["n"] += 1                                  # the page's own call counts against the budget
+            else:
+                secs = float(A.get("warm_interaction_seconds", 0) or 0)
+                if secs > 0 and wpage:
+                    await self._interact(wpage, secs)
+        state = self.__dict__.setdefault("_api_state", {})
+        st = state.setdefault(tab, {"gen": gen, "n": 0})
+        if st["gen"] != gen:                                   # new browser: warm-up page is already fresh
+            st["gen"], st["n"] = gen, 0
+        per_page = int(A.get("requests_per_page", 20) or 0)
+        site = self.cfg["site"]
+        url = f"{site['url']}/pdp/product-display/{pid}"
+        try:
+            page = self.pages[tab % len(self.pages)]
+            if (urlparse(page.url).netloc != urlparse(site["url"]).netloc or self._is_block(page.url)
+                    or (per_page and st["n"] >= per_page)):
+                await self.reopen_page(tab)
+                st["n"] = 0
+            bs["n"] += 1
+            out = await self._pdp_xhr(page, url)
+            st["n"] += 1
+            if out.get("s") in (403, 429) and heart_mode and A.get("reload_on_block", True) \
+                    and not (max_reloads and bs.get("reloads", 0) >= max_reloads):
+                if await self._cycle(tab, bs, f"HTTP {out.get('s')}"):
+                    bs["n"] += 1
+                    out = await self._pdp_xhr(page, url)
+                    st["n"] += 1
+            elif out.get("s") in (401, 403, 429) and A.get("reopen_on_block", False):
+                ok = await self.reopen_page(tab)
+                st["n"] = 0
+                if ok:
+                    bs["n"] += 1
+                    out = await self._pdp_xhr(page, url)
+                    st["n"] += 1
+        except Exception as e:
+            if gen != self.generation:
+                return Fetch("error", detail="browser restarted during fetch", secs=time.time() - t0)
+            return Fetch("error", detail=f"{type(e).__name__}: {str(e)[:80]}", secs=time.time() - t0)
+        s, body = out.get("s", 0), out.get("t") or ""
+        if s == 200 and not body.lstrip().startswith("<"):
+            return Fetch("ok", data=body, status=200, secs=time.time() - t0)
+        if s == 401 and heart_mode:
+            log_warn(f"{self.tag}PDP API HTTP 401: the nord-* headers were rejected (wrong nord-api-key?) - this is "
+                     f"not a used-up session, so the browser is kept. Body: {body[:80]!r}")
+            return Fetch("error", detail="HTTP 401 nord headers rejected", status=s, secs=time.time() - t0)
+        if s in (401, 403, 429) or (s == 200 and "access denied" in body[:600].lower()):
+            log_warn(f"{self.tag}PDP API HTTP {s} after {bs['n']} requests in this session ({proxy_label(self.proxy)})"
+                     f" - if this is below requests_per_session, lower it")
+            return Fetch("blocked", detail=f"HTTP {s}", status=s, secs=time.time() - t0)
+        if s == 404:
+            return Fetch("gone", status=s, secs=time.time() - t0)
+        return Fetch("error", detail=f"HTTP {s} {body[:60]!r}", status=s, secs=time.time() - t0)
+
     # pacing / block handling ---------------------------------------------
-    async def report(self, res: Fetch):
+    async def report(self, res: Fetch, delay=None, block_limit=None):
         """Call after EVERY fetch. Success -> polite delay. Block -> after retry.restart_after_blocks
         in a row (default 2) the browser is closed and reopened on the next proxy IMMEDIATELY (no long
         backoff first). Other errors use retry.restart_after_failures (default 5)."""
@@ -357,7 +950,7 @@ class CloakSession:
             self.pool.ok(self.proxy)
             if self.clean % 20 == 0:
                 self.slow = max(1.0, self.slow * 0.85)
-            d = float(self.cfg["retry"]["delay_seconds"])
+            d = float(self.cfg["retry"]["delay_seconds"]) if delay is None else float(delay)
             await asyncio.sleep(random.uniform(d * 0.8, d * 1.3) * self.slow)
             return
         if res.detail == "browser restarted during fetch":
@@ -367,7 +960,7 @@ class CloakSession:
         is_block = res.kind == "blocked"
         if is_block:
             self.slow = min(self.slow * 1.6, 6.0)
-        limit = int(self.r.get("restart_after_blocks", 2)) if is_block \
+        limit = int(block_limit or self.r.get("restart_after_blocks", 2)) if is_block \
             else int(self.r.get("restart_after_failures", 5))
         gen = self.generation
         if self.consec >= limit:
@@ -400,6 +993,12 @@ class TaskQueue:
 
     def __len__(self):
         return len(self.q)
+
+    def drain(self):
+        """Drop everything that has not started yet (clean stop: in-flight tasks finish)."""
+        n = len(self.q)
+        self.q.clear()
+        return n
 
     async def get(self):
         while True:
@@ -441,6 +1040,10 @@ class Crawler:
         self.n = max(1, int(workers or b["workers"]))
         self.tabs = max(1, int(b["tabs_per_browser"]))
         self.pool = ProxyPool(proxy_list(), cooldown=float(b.get("proxy_cooldown_seconds", 120)))
+        start = int(os.getenv("PROXY_START", "") or b.get("proxy_start_index", 0) or 0)
+        if start and len(self.pool):                       # begin at another entry of PROXY_LIST (0-based)
+            k = start % len(self.pool)
+            self.pool.items = self.pool.items[k:] + self.pool.items[:k]
         self.sessions, self._xvfb = [], None
 
     async def __aenter__(self):
@@ -452,6 +1055,10 @@ class Crawler:
         else:
             log_info(f"{len(self.pool)} proxies loaded, rotating in order: "
                      f"{proxy_label(self.pool.items[0])} ... {proxy_label(self.pool.items[-1])}")
+            rot = [proxy_label(p) for p in self.pool.items if "rotate" in proxy_label(p).lower()]
+            if rot:
+                log_warn(f"{len(rot)} proxy login(s) look like ROTATING exits ({rot[0]}...): the site's cookies are "
+                         "bound to one IP, so sessions on them are blocked. Use numbered (sticky) logins only.")
             if len(self.pool) == 1:
                 log_warn("PROXY_LIST holds only ONE proxy - nothing to rotate to. Separate entries with commas.")
         self.sessions = [make_session(self.cfg, f"b{i + 1}", self.pool) for i in range(self.n)]

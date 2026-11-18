@@ -41,7 +41,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlencode
 
 from nord_browser import LISTING_JS, Crawler, Fetch, TaskQueue
-from nord_core import (COLUMNS, ROOT, build_base_row, json_list_capped, load_config, load_json,
+from nord_core import (COLUMNS, ROOT, build_base_row, category_path, json_list_capped, load_config, load_json,
                        log_err, log_head, log_info, log_line, log_ok, log_warn, rpath, save_json_atomic, today)
 
 
@@ -217,9 +217,7 @@ def listing_row(r, base):
     per-size data, so size_info is blank and quantity is the product's total
     shippable quantity. Per-size rows come from phase2_enrich.py."""
     row = dict(base)
-    cats = [r["job"].split("_")[0].capitalize()] + [
-        x.replace("-", " ").title() for x in (r.get("npt_hierarchy") or "").split(".")
-        if x and x != "npt"]
+    cats = category_path(r.get("job"), r.get("npt_hierarchy"))
     for n, c in enumerate(cats[:10], 1):
         row[f"category{n}"] = c
     colors = r.get("colors") or []
@@ -463,8 +461,11 @@ async def plan_category(sess, cfg, name, cat, args, progress=None):
 
     style = None
     if L.get("group_brands", True) and not args.no_group:
-        style = (progress or {}).get("group_style")
-        if style:
+        cfg_style = (L.get("group_style") or "").strip()
+        style = cfg_style or (progress or {}).get("group_style")
+        if style and cfg_style:
+            log_info(f"[{name}] using multi-brand style '{style}' from listing.group_style (no verification requests)")
+        elif style:
             log_info(f"[{name}] using multi-brand style '{style}' verified earlier in this run")
         else:
             verdict = None
@@ -501,16 +502,51 @@ async def plan_category(sess, cfg, name, cat, args, progress=None):
     return info, parts, None
 
 
+def compute_quotas(cfg, categories, progress, override=None) -> dict:
+    """{category: max products}. listing.limits.max_products = total over the categories being crawled
+    (0 / missing = unlimited); split = "weights" (listing.limits.weights, e.g. women 0.5 / men 0.3 / kids 0.2),
+    "equal" or "proportional" (by the category's resultCount)."""
+    lim = cfg["listing"].get("limits") or {}
+    total = int(override if override is not None else (lim.get("max_products") or 0))
+    if total <= 0:
+        return {}
+    mode = str(lim.get("split") or "weights").lower()
+    if mode == "proportional":
+        w = {c: float((progress["plan"].get(c) or {}).get("result_count") or 1) for c in categories}
+    elif mode == "weights" and sum(float((lim.get("weights") or {}).get(c, 0)) for c in categories) > 0:
+        w = {c: float((lim.get("weights") or {}).get(c, 0)) for c in categories}
+    else:
+        w = {c: 1.0 for c in categories}
+    sw = sum(w.values())
+    return {c: int(round(total * w[c] / sw)) for c in categories}
+
+def load_counts(jsonl: Path) -> Counter:
+    counts = Counter()
+    if jsonl.exists():
+        with open(jsonl, encoding="utf-8") as f:
+            for line in f:
+                try:
+                    counts[json.loads(line).get("job")] += 1
+                except ValueError:
+                    pass
+    return counts
+
+
 # ── the crawl ─────────────────────────────────────────────────────────────
 class Listing:
-    def __init__(self, cfg, args, progress, seen, fh):
+    def __init__(self, cfg, args, progress, seen, fh, counts=None, quota=None):
         self.cfg, self.args, self.progress, self.seen, self.fh = cfg, args, progress, seen, fh
+        self.cat_n, self.quota = Counter(counts or {}), dict(quota or {})
         self.parts, self.gaps = progress["partitions"], progress["gaps"]
         self.stats, self.queue = Counter(), TaskQueue()
         self.t0, self.last_save, self.last_print = time.time(), time.time(), 0.0
         self.prog_file = rpath(cfg, "listing_progress")
         self.max_fails = int(cfg["listing"]["max_attempts"])
         self.max_empty = int(cfg["listing"]["empty_page_retries"])
+
+    def reached(self, cat) -> bool:
+        q = self.quota.get(cat)
+        return q is not None and self.cat_n[cat] >= q
 
     def save(self, force=False):
         if force or time.time() - self.last_save >= 5:
@@ -541,11 +577,14 @@ class Listing:
             pid = str(pid)
             if pid in self.seen:
                 continue
+            if self.reached(P["category"]):
+                break                                   # listing.limits: this category has its share
             rank = ((page - 1) * (P["per_page"] or len(prods)) + rank_of[pid]) if pid in rank_of else None
             rec = parse_product(pid, prod, site, P["category"], page, rank, pid in rank_of, now)
             rec["brand_filter"] = ",".join(P["brands"]) if P["brands"] else None
             self.fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
             self.seen.add(pid)
+            self.cat_n[P["category"]] += 1
             new += 1
         self.fh.flush()
         if page not in P["done_pages"]:
@@ -561,6 +600,9 @@ class Listing:
         key, page = task["key"], task["page"]
         P = self.parts[key]
         if page in P["done_pages"]:
+            return
+        if self.reached(P["category"]):
+            self.stats["skipped_by_limit"] += 1         # category quota reached: leave the page for a later, bigger run
             return
         url = build_url(self.cfg, self.cfg["categories"][P["category"]], page, P["brands"], P["style"])
         res = await fetch_listing(sess, self.cfg, url, tab, False, expect=f"page={page}" if page > 1 else None)
@@ -597,7 +639,8 @@ class Listing:
         remaining = sum(max((p["page_count"] or 1) - len(p["done_pages"]), 0) for p in self.parts.values()
                         if not p["done"])
         eta = remaining / rate / 60 if rate else 0
-        log_line(f"progress: {done}/{len(self.parts)} partitions done | {len(self.seen):,} products | "
+        quota = (" | " + ", ".join(f"{c} {self.cat_n[c]:,}/{q:,}" for c, q in self.quota.items())) if self.quota else ""
+        log_line(f"progress: {done}/{len(self.parts)} partitions done | {len(self.seen):,} products{quota} | "
                  f"{self.stats['pages']} pages ({rate:.2f}/s) | failed requests {self.stats['failed_requests']} | "
                  f"~{remaining} pages left, ETA ~{eta:.0f} min")
 
@@ -649,7 +692,7 @@ async def run_listing(cfg, args):
     log_info(f"{len(seen):,} products already saved | source: {cfg['listing']['source']}")
 
     fh = open(jsonl, "a", encoding="utf-8")
-    state = Listing(cfg, args, progress, seen, fh)
+    state = Listing(cfg, args, progress, seen, fh, counts=load_counts(jsonl))
     try:
         async with Crawler(cfg) as crawler:
             sess = crawler.sessions[0]
@@ -665,6 +708,11 @@ async def run_listing(cfg, args):
                 if first is not None:                  # page 1 is already in hand
                     state.ingest(f"{name}|all", 1, first)
                 state.save(force=True)
+            state.quota = compute_quotas(cfg, categories, progress, args.max_products)
+            if state.quota:
+                log_info("listing limits: " + ", ".join(f"{c} {q:,}" for c, q in state.quota.items())
+                         + f" (total {sum(state.quota.values()):,}; already saved: "
+                         + ", ".join(f"{c} {state.cat_n[c]:,}" for c in state.quota) + ")")
             n = state.initial_tasks(categories)
             est = sum(max((p["page_count"] or math.ceil(p["expected"] / max(
                     progress["plan"][p["category"]]["per_page"], 1))) - len(p["done_pages"]), 0)
@@ -690,7 +738,8 @@ async def run_listing(cfg, args):
     log_ok(f"{sum(counts.values()):,} unique products saved ({', '.join(f'{c}: {n:,}' for c, n in counts.items())})")
     (log_warn if open_parts else log_ok)(
         f"{len(state.parts) - len(open_parts):,}/{len(state.parts):,} partitions complete"
-        + (f"; {len(open_parts)} unfinished - re-run to resume" if open_parts else ""))
+        + ((f"; {len(open_parts)} not finished" + (" (stopped by listing.limits)" if state.quota else " - re-run to resume"))
+           if open_parts else ""))
     if state.gaps:
         (ROOT / cfg["files"]["listing_gaps"]).parent.mkdir(parents=True, exist_ok=True)
         (ROOT / cfg["files"]["listing_gaps"]).write_text(json.dumps(state.gaps, indent=2), encoding="utf-8")
@@ -741,6 +790,7 @@ def main():
     ap.add_argument("--replan", action="store_true", help="discard the saved plan for the selected categories and plan again (keeps saved products)")
     ap.add_argument("--no-group", action="store_true", help="never pack brands into groups")
     ap.add_argument("--top", type=int, help="override listing.top (items per request)")
+    ap.add_argument("--max-products", type=int, default=None, help="override listing.limits.max_products (total over the categories; 0 = unlimited)")
     ap.add_argument("--source", choices=["page", "api"], help="override listing.source")
     ap.add_argument("--discover", action="store_true", help="dump page-1 structure and facets per category")
     ap.add_argument("--export-csv", action="store_true", help="only rebuild listing.csv from the JSONL")

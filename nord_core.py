@@ -17,7 +17,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 ROOT = Path(__file__).resolve().parent
-load_dotenv(ROOT / ".env")
+load_dotenv(ROOT / ".env", override=True)
 
 
 # ── logging ───────────────────────────────────────────────────────────────
@@ -181,6 +181,16 @@ class ProxyPool:
     def ok(self, proxy):
         if proxy:
             self.cool_until[proxy["url"]] = 0.0
+
+
+# ── category path ─────────────────────────────────────────────────────────
+def category_path(job, npt, max_levels=10) -> list:
+    """['Women', 'Clothing', 'Tops', 'Sweaters'] from the listing job (women/men/kids) + nptHierarchy
+    ('npt.clothing.tops.sweaters'). Underscores / dashes become spaces: Coats_And_Jackets -> Coats And Jackets."""
+    gender = (job or "").split("_")[0].strip().capitalize()
+    parts = [re.sub(r"[_\-]+", " ", x).strip().title() for x in (npt or "").split(".")
+             if x and x.strip().lower() != "npt"]
+    return [c for c in [gender] + parts if c][:max_levels]
 
 
 # ── DBQ E0005 columns ─────────────────────────────────────────────────────
