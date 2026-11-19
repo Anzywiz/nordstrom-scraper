@@ -236,6 +236,11 @@ class CloakSession:
         if browser is None:
             raise last
         self.browser = browser
+        try:
+            gen_at = self.generation
+            browser.on("disconnected", lambda *_: self._note_disconnect(gen_at))
+        except Exception:
+            pass
         self.ctx = await browser.new_context()
         if self._blocked_types or self._blocked_urls:
             await self.ctx.route("**/*", self._route)
@@ -292,6 +297,7 @@ class CloakSession:
         self.pool.release(self.proxy)
 
     async def stop(self):
+        self._stopping = True
         await self._close()
 
     async def restart(self, seen_generation=None):
@@ -527,10 +533,17 @@ class CloakSession:
     async def _fetch_api_next(self, url, tab=0, keep_facets=False) -> Fetch:
         t0 = time.time()
         A = self.listing_api_cfg()
+        gen = self.generation
         reason = await self._lst_prepare(tab)
         if reason:
             log_warn(f"{self.tag}listing mint failed ({reason}) on {proxy_label(self.proxy)}")
-            return Fetch("blocked", detail=f"mint: {reason}", secs=time.time() - t0)
+            if gen != self.generation:
+                return Fetch("error", detail="browser restarted during fetch", secs=time.time() - t0)
+            if "closed" in reason.lower():
+                await self._restart_dead(gen, reason)
+                return Fetch("error", detail="browser restarted during fetch", secs=time.time() - t0)
+            blockish = reason.startswith(("block page", "the page's own", "no product tiles"))
+            return Fetch("blocked" if blockish else "error", detail=f"mint: {reason}", secs=time.time() - t0)
         st = self._lst
         page = self.pages[tab % len(self.pages)]
         arg = {"url": url, "keepFacets": keep_facets, "timeout": 40000}
@@ -543,6 +556,11 @@ class CloakSession:
                 out = await asyncio.wait_for(page.evaluate(LISTING_XHR_JS, arg),
                                              timeout=float(self.b["config_timeout_seconds"]) + 30)
             except Exception as e:
+                if gen != self.generation:
+                    return Fetch("error", detail="browser restarted during fetch", secs=time.time() - t0)
+                if "target" in str(e).lower() and "closed" in str(e).lower():
+                    await self._restart_dead(gen, str(e))
+                    return Fetch("error", detail="browser restarted during fetch", secs=time.time() - t0)
                 return Fetch("error", detail=f"{type(e).__name__}: {str(e)[:80]}", secs=time.time() - t0)
             st["n"] += 1
             if out.get("s") in (403, 429) and attempt == 1 and A.get("reload_on_block", True) \
@@ -724,6 +742,18 @@ class CloakSession:
                 page.remove_listener("request", on_req)
             except Exception:
                 pass
+
+    async def _restart_dead(self, gen, why=""):
+        """The browser is closed but nobody restarted it (crash / killed / proxy dropped): replace it now.
+        restart(gen) is a no-op if another tab already did."""
+        log_warn(f"{self.tag}browser closed unexpectedly ({str(why)[:60]}) on {proxy_label(self.proxy)} "
+                 f"-> restarting on the next proxy")
+        await self.restart(gen)
+
+    def _note_disconnect(self, gen):
+        if gen == self.generation and self._ready.is_set() and not self.__dict__.get("_stopping"):
+            log_warn(f"{self.tag}browser process disconnected unexpectedly (crash or killed?) -> restarting")
+            asyncio.get_event_loop().create_task(self._restart_dead(gen, "disconnected"))
 
     async def _goto_retry(self, page, url, reload=False, timeout=45000) -> str:
         """goto / reload with up to 3 tries on the transient 'net::ERR_ABORTED / frame was detached' errors.
@@ -916,7 +946,10 @@ class CloakSession:
                 why = await self._mint_guard(self._mint_heart(wpage) if heart_mode else self._mint_session(wpage))
                 if why:
                     log_warn(f"{self.tag}session mint failed ({why}) on {proxy_label(self.proxy)}")
-                    if gen != self.generation or "closed" in why.lower():
+                    if gen != self.generation:
+                        return Fetch("error", detail="browser restarted during fetch", secs=time.time() - t0)
+                    if "closed" in why.lower():                # died on its own: replace it, do not spin
+                        await self._restart_dead(gen, why)
                         return Fetch("error", detail="browser restarted during fetch", secs=time.time() - t0)
                     blockish = why.startswith(("block page", "the page's own", "no product tiles"))
                     return Fetch("blocked" if blockish else "error", detail=f"mint failed: {why}", secs=time.time() - t0)
@@ -959,6 +992,9 @@ class CloakSession:
         except Exception as e:
             if gen != self.generation:
                 return Fetch("error", detail="browser restarted during fetch", secs=time.time() - t0)
+            if "target" in str(e).lower() and "closed" in str(e).lower():
+                await self._restart_dead(gen, str(e))
+                return Fetch("error", detail="browser restarted during fetch", secs=time.time() - t0)
             return Fetch("error", detail=f"{type(e).__name__}: {str(e)[:80]}", secs=time.time() - t0)
         s, body = out.get("s", 0), out.get("t") or ""
         if s == 200 and not body.lstrip().startswith("<"):
@@ -989,7 +1025,13 @@ class CloakSession:
             await asyncio.sleep(random.uniform(d * 0.8, d * 1.3) * self.slow)
             return
         if res.detail == "browser restarted during fetch":
-            return                                   # another tab restarted it: not a new failure
+            rs = self.__dict__.setdefault("_rs_seen", [None, 0])
+            if rs[0] != self.generation:
+                rs[0], rs[1] = self.generation, 0
+            rs[1] += 1
+            if rs[1] <= 3:
+                return                               # another tab restarted it: not a new failure
+            # the same generation again and again: nothing restarted it, so count it as a real failure below
         self.consec += 1
         self.clean = 0
         is_block = res.kind == "blocked"

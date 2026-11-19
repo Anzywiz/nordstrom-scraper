@@ -311,6 +311,11 @@ class Enrich:
             self.progress()
             return
 
+        if res.detail == "browser restarted during fetch" and task.get("soft", 0) < 40:
+            task["soft"] = task.get("soft", 0) + 1       # the browser's fault, not the product's: no attempt used
+            await asyncio.sleep(1.0)
+            self.queue.put(task)
+            return
         task["attempts"] += 1
         if note == "no entity" and task["attempts"] >= int(self.E["no_entity_attempts"]):
             self.finish_gone(pid)                            # product page without a product: delisted
@@ -428,6 +433,13 @@ async def run_enrich(cfg, args):
                  f"left for the next run; moving on is safe, products.csv holds everything fetched so far")
     log_ok(f"Finished: {s['ok']:,} products -> {s['rows']:,} rows in {csv_path.name} "
            f"({s['gone']:,} gone, {s['failed']:,} failed -> {failed_path.name})")
+    tried = s["ok"] + s["gone"] + s["failed"]
+    ratio_limit = float(cfg["enrich"].get("fail_exit_ratio", 0.3) or 0)
+    if ratio_limit and tried >= 50 and s["failed"] / tried > ratio_limit:
+        log_err(f"{s['failed']:,} of {tried:,} products failed ({s['failed'] / tried:.0%} > enrich.fail_exit_ratio "
+                f"{ratio_limit:.0%}): exiting with code 4 so the convert/upload phases do not run on a mostly empty "
+                f"products.csv. Re-run phase 2: the failed ids are retried, finished ones are skipped.")
+        raise SystemExit(4)
 
 
 async def run_single(cfg, url, dump):

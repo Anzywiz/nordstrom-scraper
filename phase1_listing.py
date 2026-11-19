@@ -620,6 +620,11 @@ class Listing:
             self.save()
             self.tick()
             return
+        if res.detail == "browser restarted during fetch" and task.get("soft", 0) < 40:
+            task["soft"] = task.get("soft", 0) + 1       # the browser's fault, not the page's: no try used
+            await asyncio.sleep(1.0)
+            self.queue.put(task)
+            return
         task["tries"] += 1
         self.stats["failed_requests"] += 1
         if res.kind == "gone" or task["tries"] >= self.max_fails or task["empties"] > self.max_empty:
