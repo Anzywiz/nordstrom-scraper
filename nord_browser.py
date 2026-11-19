@@ -200,8 +200,8 @@ class CloakSession:
             ok = False
             try:
                 self.proxy = self.pool.acquire(self.tag)
-                await self._launch(self.proxy)
-                ok = await self._warmup()
+                await asyncio.wait_for(self._launch(self.proxy), 120)
+                ok = await asyncio.wait_for(self._warmup(), 150)
             except Exception as e:
                 log_warn(f"{self.tag}browser start failed: {type(e).__name__}: {str(e)[:120]}")
             if ok:
@@ -210,7 +210,7 @@ class CloakSession:
             await self._close()
             if limit and n >= limit:
                 raise RuntimeError(f"No accepted session after {n} attempts (browser.session_attempts={limit})")
-            wait = float(self.b.get("session_retry_wait_seconds", 3)) + random.uniform(0, 2)
+            wait = float(self.b.get("session_retry_wait_seconds", 3)) + random.uniform(0, 2) + min(90.0, 5.0 * max(0, n - 2))
             log_warn(f"{self.tag}session attempt {n} rejected ({proxy_label(self.proxy)}); waiting {wait:.0f}s, then next proxy")
             await asyncio.sleep(wait)
 
@@ -239,7 +239,7 @@ class CloakSession:
         self.ctx = await browser.new_context()
         if self._blocked_types or self._blocked_urls:
             await self.ctx.route("**/*", self._route)
-        n_tabs = max(1, int(self.b["tabs_per_browser"]))
+        n_tabs = int(getattr(self, "n_tabs", 0) or 0) or max(1, int(self.b["tabs_per_browser"]))
         self.pages = [await self.ctx.new_page() for _ in range(n_tabs)]
 
     async def _route(self, route):
@@ -284,7 +284,7 @@ class CloakSession:
         for obj in (self.ctx, self.browser):
             try:
                 if obj:
-                    await obj.close()
+                    await asyncio.wait_for(obj.close(), 20)
             except Exception:
                 pass
         self.ctx = self.browser = None
@@ -305,7 +305,13 @@ class CloakSession:
             self.pool.fail(self.proxy)
             await self._close()
             await asyncio.sleep(random.uniform(3, 6))
-            await self._boot_until_healthy()
+            try:
+                await self._boot_until_healthy()
+            except Exception as e:
+                self.dead = True
+                self._ready.set()
+                log_err(f"{self.tag}could not start a new browser ({str(e)[:100]}); this browser is out of the run")
+                raise
             self.consec = 0
             self.slow = 1.0              # a block belongs to the old session/IP
             self._ready.set()
@@ -416,10 +422,9 @@ class CloakSession:
 
         page.on("request", on_req)
         try:
-            try:
-                await page.goto(url, wait_until="domcontentloaded", timeout=45000)
-            except Exception as e:
-                return f"navigation: {str(e)[:60]}"
+            err = await self._goto_retry(page, url)
+            if err:
+                return f"navigation: {err}"
             tiles, t_end, found = page.locator(HEART_TILE_SEL), time.time() + float(A.get("mint_timeout_seconds", 40)), False
             while time.time() < t_end:
                 try:
@@ -508,7 +513,7 @@ class CloakSession:
         page = self.pages[tab % len(self.pages)]
         async with lock:
             t0 = time.time()
-            reason = await self._mint_listing(page)
+            reason = await self._mint_guard(self._mint_listing(page), float(A.get("mint_total_timeout_seconds", 120)))
         if reason:
             st["ready"] = False
             return reason
@@ -720,6 +725,36 @@ class CloakSession:
             except Exception:
                 pass
 
+    async def _goto_retry(self, page, url, reload=False, timeout=45000) -> str:
+        """goto / reload with up to 3 tries on the transient 'net::ERR_ABORTED / frame was detached' errors.
+        Returns '' on success, else the error text (no retry once the browser itself is gone)."""
+        last = ""
+        for attempt in range(3):
+            try:
+                if reload and attempt == 0:
+                    await page.reload(wait_until="domcontentloaded", timeout=timeout)
+                else:
+                    await page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+                return ""
+            except Exception as e:
+                last, low = f"{type(e).__name__}: {str(e)[:60]}", str(e).lower()
+                if "target" in low and "closed" in low:
+                    return last
+                if not ("err_aborted" in low or "detached" in low or "interrupted" in low):
+                    return last
+                await asyncio.sleep(1.5 + attempt * 1.5)
+        return last
+
+    async def _mint_guard(self, coro, secs=None) -> str:
+        """Run a mint coroutine with an overall time limit; any failure becomes a reason string ('' = ok)."""
+        secs = float(secs or self.api_cfg().get("mint_total_timeout_seconds", 120))
+        try:
+            return await asyncio.wait_for(coro, secs)
+        except asyncio.TimeoutError:
+            return f"mint timed out after {secs:.0f}s"
+        except Exception as e:
+            return f"{type(e).__name__}: {str(e)[:70]}"
+
     async def _mint_heart(self, page, reload=False) -> str:
         """Open (or reload) a listing page and click the wishlist heart on a tile. The page then makes its own
         /pdp/product-display/ call, which is what switches on the bot-manager script for our later in-page XHRs.
@@ -737,14 +772,10 @@ class CloakSession:
 
         page.on("request", on_req)
         try:
-            try:
-                same = urlparse(page.url).path == urlparse(url).path
-                if reload and same:
-                    await page.reload(wait_until="domcontentloaded", timeout=45000)
-                else:
-                    await page.goto(url, wait_until="domcontentloaded", timeout=45000)
-            except Exception as e:
-                return f"navigation: {str(e)[:60]}"
+            same = urlparse(page.url).path == urlparse(url).path
+            err = await self._goto_retry(page, url, reload=reload and same)
+            if err:
+                return f"navigation: {err}"
             hearts, tiles = page.locator(HEART_SEL), page.locator(HEART_TILE_SEL)
             t_end, found = time.time() + float(A.get("mint_timeout_seconds", 40)), False
             while time.time() < t_end:
@@ -823,7 +854,7 @@ class CloakSession:
         lock = self.__dict__.setdefault("_mint_lock", asyncio.Lock())
         async with lock:
             t0 = time.time()
-            reason = await self._mint_heart(page, reload=True)
+            reason = await self._mint_guard(self._mint_heart(page, reload=True))
         if reason:
             log_warn(f"{self.tag}reload+heart failed ({reason}) on {proxy_label(self.proxy)}")
             return False
@@ -880,15 +911,19 @@ class CloakSession:
             gen = self.generation
             bs.update(gen=gen, n=0, warm=False, reloads=0)
         if not bs["warm"]:
-            bs["warm"] = True
             wpage = self.pages[tab % len(self.pages)] if self.pages else None
             if wpage and A.get("mint_click", True):
-                why = await (self._mint_heart(wpage) if heart_mode else self._mint_session(wpage))
+                why = await self._mint_guard(self._mint_heart(wpage) if heart_mode else self._mint_session(wpage))
                 if why:
                     log_warn(f"{self.tag}session mint failed ({why}) on {proxy_label(self.proxy)}")
-                    return Fetch("blocked", detail=f"mint failed: {why}", secs=time.time() - t0)
+                    if gen != self.generation or "closed" in why.lower():
+                        return Fetch("error", detail="browser restarted during fetch", secs=time.time() - t0)
+                    blockish = why.startswith(("block page", "the page's own", "no product tiles"))
+                    return Fetch("blocked" if blockish else "error", detail=f"mint failed: {why}", secs=time.time() - t0)
+                bs["warm"] = True
                 bs["n"] += 1                                  # the page's own call counts against the budget
             else:
+                bs["warm"] = True
                 secs = float(A.get("warm_interaction_seconds", 0) or 0)
                 if secs > 0 and wpage:
                     await self._interact(wpage, secs)
@@ -986,7 +1021,7 @@ class TaskQueue:
     so handlers can add follow-up tasks (retries, next pages) while others are still running."""
 
     def __init__(self, items=()):
-        self.q, self.inflight = deque(items), 0
+        self.q, self.inflight, self.completed = deque(items), 0, 0
 
     def put(self, task, front=False):
         (self.q.appendleft if front else self.q.append)(task)
@@ -1011,6 +1046,7 @@ class TaskQueue:
 
     def done(self):
         self.inflight -= 1
+        self.completed += 1
 
 
 def ensure_display(cfg):
@@ -1034,16 +1070,29 @@ class Crawler:
                await crawler.run(queue, handler)    # parallel: browsers x tabs
     handler(task, session, tab) fetches + processes one task and may queue.put() follow-ups."""
 
-    def __init__(self, cfg, workers=None):
+    def __init__(self, cfg, workers=None, single_tab=False):
         self.cfg = cfg
         b = cfg["browser"]
         self.n = max(1, int(workers or b["workers"]))
         self.tabs = max(1, int(b["tabs_per_browser"]))
+        if single_tab and self.tabs > 1:
+            # the API modes mint (heart / Next click) and reload one page; several tabs fight over the same
+            # navigations ("ERR_ABORTED ... frame was detached") and over the shared request budget
+            log_warn(f"API mode uses ONE tab per browser (browser.tabs_per_browser={self.tabs} ignored): "
+                     f"raise browser.workers for parallelism instead (each worker = own browser + own proxy)")
+            self.tabs = 1
         self.pool = ProxyPool(proxy_list(), cooldown=float(b.get("proxy_cooldown_seconds", 120)))
         start = int(os.getenv("PROXY_START", "") or b.get("proxy_start_index", 0) or 0)
-        if start and len(self.pool):                       # begin at another entry of PROXY_LIST (0-based)
+        order = (os.getenv("PROXY_ORDER", "") or b.get("proxy_order", "random")).strip().lower()
+        if start and len(self.pool):                       # explicit: begin at this entry of PROXY_LIST (0-based)
             k = start % len(self.pool)
             self.pool.items = self.pool.items[k:] + self.pool.items[:k]
+            self.order_note = f"in order from entry {k}"
+        elif order == "random" and len(self.pool):         # default: a different order on every run
+            random.shuffle(self.pool.items)
+            self.order_note = "in random order"
+        else:
+            self.order_note = "in list order"
         self.sessions, self._xvfb = [], None
 
     async def __aenter__(self):
@@ -1053,8 +1102,8 @@ class Crawler:
         if not len(self.pool):
             log_info("No PROXY_LIST set: connecting directly")
         else:
-            log_info(f"{len(self.pool)} proxies loaded, rotating in order: "
-                     f"{proxy_label(self.pool.items[0])} ... {proxy_label(self.pool.items[-1])}")
+            log_info(f"{len(self.pool)} proxies loaded, rotating {self.order_note} "
+                     f"(first: {proxy_label(self.pool.items[0])})")
             rot = [proxy_label(p) for p in self.pool.items if "rotate" in proxy_label(p).lower()]
             if rot:
                 log_warn(f"{len(rot)} proxy login(s) look like ROTATING exits ({rot[0]}...): the site's cookies are "
@@ -1062,6 +1111,8 @@ class Crawler:
             if len(self.pool) == 1:
                 log_warn("PROXY_LIST holds only ONE proxy - nothing to rotate to. Separate entries with commas.")
         self.sessions = [make_session(self.cfg, f"b{i + 1}", self.pool) for i in range(self.n)]
+        for sess in self.sessions:
+            sess.n_tabs = self.tabs
         stagger = float(self.cfg["browser"].get("start_stagger_seconds", 8))
 
         async def boot(i, s):
@@ -1082,6 +1133,10 @@ class Crawler:
                 task = await queue.get()
                 if task is None:
                     return
+                if getattr(sess, "dead", False):
+                    queue.put(task, front=True)             # hand the task back to the browsers that still work
+                    queue.done()
+                    return
                 try:
                     await handler(task, sess, tab)
                 except asyncio.CancelledError:
@@ -1091,9 +1146,36 @@ class Crawler:
                 finally:
                     queue.done()
 
+        async def safe_restart(sess):
+            try:
+                await sess.restart()
+            except Exception as e:
+                log_err(f"{sess.tag}forced restart failed: {str(e)[:100]}")
+
+        async def watchdog():
+            stall = float(self.cfg["browser"].get("stall_restart_seconds", 300) or 0)
+            if stall <= 0:
+                return
+            seen, since = -1, time.time()
+            while True:
+                await asyncio.sleep(min(15.0, max(1.0, stall / 4)))
+                if queue.completed != seen or not (queue.q or queue.inflight):
+                    seen, since = queue.completed, time.time()
+                    continue
+                if time.time() - since < stall:
+                    continue
+                since = time.time()
+                for sess in self.sessions:
+                    if sess._ready.is_set() and not getattr(sess, "dead", False):
+                        log_warn(f"{sess.tag}no task finished for {stall:.0f}s -> forcing a browser restart "
+                                 f"(a page call is probably hung)")
+                        asyncio.create_task(safe_restart(sess))
+
         workers = [asyncio.create_task(worker(s, t)) for s in self.sessions for t in range(self.tabs)]
+        dog = asyncio.create_task(watchdog())
         try:
             await asyncio.gather(*workers)
         finally:
+            dog.cancel()
             for w in workers:
                 w.cancel()

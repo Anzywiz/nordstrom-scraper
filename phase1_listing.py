@@ -694,7 +694,7 @@ async def run_listing(cfg, args):
     fh = open(jsonl, "a", encoding="utf-8")
     state = Listing(cfg, args, progress, seen, fh, counts=load_counts(jsonl))
     try:
-        async with Crawler(cfg) as crawler:
+        async with Crawler(cfg, single_tab=cfg["listing"]["source"] == "api") as crawler:
             sess = crawler.sessions[0]
             for name in categories:
                 if name in progress["plan"]:
@@ -749,7 +749,7 @@ async def run_listing(cfg, args):
 async def run_discover(cfg, args):
     out_dir = ROOT / cfg["output_dir"]
     out_dir.mkdir(exist_ok=True)
-    async with Crawler(cfg, workers=1) as crawler:
+    async with Crawler(cfg, workers=1, single_tab=cfg["listing"]["source"] == "api") as crawler:
         sess = crawler.sessions[0]
         for name, cat in cfg["categories"].items():
             if args.category and name != args.category:

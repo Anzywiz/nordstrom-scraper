@@ -358,8 +358,19 @@ def stop_deadline(cfg, args):
 async def run_enrich(cfg, args):
     deadline = stop_deadline(cfg, args)
     if deadline and time.time() >= deadline:
-        log_warn(f"past the stop time ({datetime.fromtimestamp(deadline):%H:%M}) - skipping enrichment "
-                 f"(--no-stop to run anyway); the next pipeline phases can use what is in products.csv")
+        stop_txt = f"{datetime.fromtimestamp(deadline):%H:%M}"
+        run_file = rpath(cfg, "enrich_run")
+        try:
+            last_run = json.loads(run_file.read_text()).get("run_date") if run_file.exists() else None
+        except ValueError:
+            last_run = None
+        if last_run != today():
+            # products.csv (if any) is from an earlier day: never let convert/upload pick it up as today's data
+            log_err(f"past the stop time ({stop_txt}) and there is no enrichment from today (last run: {last_run or 'never'}); "
+                    f"exiting with code 3 so main.py does not convert/upload stale data. Use --no-stop to run anyway.")
+            raise SystemExit(3)
+        log_warn(f"past the stop time ({stop_txt}) - skipping enrichment (--no-stop to run anyway); "
+                 f"the next phases use today's products.csv as it is")
         return
     if deadline:
         log_info(f"enrichment stops at {datetime.fromtimestamp(deadline):%Y-%m-%d %H:%M} (server time)")
@@ -394,7 +405,7 @@ async def run_enrich(cfg, args):
     for pid, url, job, npt in pending:
         state.queue.put({"pid": pid, "url": url, "job": job, "npt": npt, "attempts": 0})
     try:
-        async with Crawler(cfg) as crawler:
+        async with Crawler(cfg, single_tab=cfg["enrich"].get("source") == "api") as crawler:
             state.crawler = crawler
             A = cfg["enrich"].get("api") or {}
             log_info(f"{crawler.n} browser(s) x {crawler.tabs} tab(s) | source: {cfg['enrich'].get('source', 'html')}"
@@ -421,7 +432,7 @@ async def run_enrich(cfg, args):
 
 async def run_single(cfg, url, dump):
     pid = product_id_from(url)
-    async with Crawler(cfg, workers=1) as crawler:
+    async with Crawler(cfg, workers=1, single_tab=cfg["enrich"].get("source") == "api") as crawler:
         sess = crawler.sessions[0]
         if dump:
             res = await sess.fetch_config(url, "() => JSON.stringify(window.__INITIAL_CONFIG__ || null)",
@@ -456,7 +467,7 @@ async def run_compare(cfg, url):
     """Fetch one product through BOTH sources, parse both with parse_payload, and list the columns that differ."""
     pid = product_id_from(url)
     base = build_base_row(cfg)
-    async with Crawler(cfg, workers=1) as crawler:
+    async with Crawler(cfg, workers=1, single_tab=cfg["enrich"].get("source") == "api") as crawler:
         sess = crawler.sessions[0]
         h = await sess.fetch_config(url, PDP_JS, pid, expect=f"/{pid}")
         a = await sess.fetch_pdp_api(pid)
